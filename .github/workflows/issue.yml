@@ -62,7 +62,7 @@ jobs:
             const slug = title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,50) || mode;
             const tmpBranch = `${mode}/tmp-${context.payload.issue.number}-${slug}`;
             const isDraft = mode === 'feature';
-            const ccPrefix = isDraft ? 'feat: ' : 'fix: ';
+            const ccPrefix = isDraft ? 'feature: ' : 'hotfix: ';
             core.setOutput('default', defaultBranch);
             core.setOutput('tmpBranch', tmpBranch);
             core.setOutput('slug', slug);
