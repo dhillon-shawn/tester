@@ -3,19 +3,15 @@ on:
   issues:
     types: [opened]
 
-permissions:
-  write-all
+permissions: write-all
 
 jobs:
   assign:
-    # only run if the newly opened issue has feature or hotfix label
     if: >
       contains(join(github.event.issue.labels.*.name, ','), 'feature') ||
       contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
     runs-on: ubuntu-latest
-
     steps:
-      # Ensure the issue has an assignee; if none, assign the creator
       - name: Check if issue has assignees
         id: check
         run: |
@@ -29,10 +25,9 @@ jobs:
         if: steps.check.outputs.has_assignees == 'false'
         uses: pozil/auto-assign-issue@v2
         with:
-          assignees: '${{ github.event.issue.user.login }}'
+          assignees: "${{ github.event.issue.user.login }}"
           numOfAssignee: 1
 
-      # Re-fetch fresh issue data (labels/assignees/milestone)
       - name: Refresh issue data
         id: issue
         uses: actions/github-script@v7
@@ -47,9 +42,8 @@ jobs:
             core.setOutput('assignees', JSON.stringify((issue.assignees || []).map(a => a.login)));
             core.setOutput('milestone', issue.milestone ? String(issue.milestone.number) : '');
             const names = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
-            core.setOutput('mode', names.includes('hotfix') ? 'hotfix' : 'feature'); // since job filter ensures one of them
+            core.setOutput('mode', names.includes('hotfix') ? 'hotfix' : 'feature');
 
-      # Build names/flags
       - name: Derive metadata
         id: meta
         uses: actions/github-script@v7
@@ -81,10 +75,10 @@ jobs:
           MODE: ${{ steps.issue.outputs.mode }}
         run: |
           set -eux
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git commit --allow-empty -m "chore: init ${MODE} branch for #${ISSUE_NUMBER} [skip ci]"
+          git commit --allow-empty -m "init ${MODE} branch for #${ISSUE_NUMBER} [skip ci]"
           git push --set-upstream origin "$BRANCH"
 
       - name: Open PR and copy details
@@ -109,15 +103,14 @@ jobs:
 
             const { data: pr } = await github.rest.pulls.create({ ...repo, title, head, base, body, draft: isDraft });
 
-            // Labels
             const labels = JSON.parse('${{ steps.issue.outputs.labels }}').map(l => typeof l === 'string' ? l : l.name);
             if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
 
-            // Milestone
+
             const milestone = '${{ steps.issue.outputs.milestone }}';
             if (milestone) await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
 
-            // Assignees: use refreshed issue's assignees or the creator if still none
+
             const refreshedAssignees = JSON.parse('${{ steps.issue.outputs.assignees }}');
             const finalAssignees = refreshedAssignees.length ? refreshedAssignees : ['${{ github.event.issue.user.login }}'];
             await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: finalAssignees });
@@ -125,53 +118,28 @@ jobs:
             core.setOutput('pr_number', String(pr.number));
             core.setOutput('pr_url', pr.html_url);
 
-      # Rename the branch to match the actual PR number
-      - name: Rename branch to PR-numbered name (with fallback)
+      - name: Rename branch to PR-numbered name
         id: rename
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const mode = '${{ steps.issue.outputs.mode }}';          // "feature" | "hotfix"
+            const mode = '${{ steps.issue.outputs.mode }}';         
             const slug = '${{ steps.meta.outputs.slug }}';
-            const oldName = '${{ steps.meta.outputs.tmpBranch }}';   // e.g. feature/tmp-26-foo
+            const oldName = '${{ steps.meta.outputs.tmpBranch }}';  
             const prNumber = Number('${{ steps.createpr.outputs.pr_number }}');
             const newName = `${mode}/${prNumber}-${slug}`;
 
-            // Try the official rename endpoint first
             try {
               await github.request('POST /repos/{owner}/{repo}/branches/{branch}/rename', {
                 owner: repo.owner,
                 repo: repo.repo,
-                branch: oldName,     // branch name without refs/heads/
+                branch: oldName,     
                 new_name: newName
               });
-              core.info(`Renamed branch '${oldName}' → '${newName}'`);
+              core.info(`Renamed branch '${oldName}' -> '${newName}'`);
             } catch (err) {
-              core.warning(`Rename API failed (${err.status || 'n/a'}): ${err.message}. Falling back to ref create/delete…`);
-
-              // Fallback: create refs/heads/newName at the same SHA and delete the old ref
-              // 1) Get the current SHA of the old branch
-              const { data: ref } = await github.rest.git.getRef({
-                ...repo,
-                ref: `heads/${oldName}`
-              });
-
-              // 2) Create the new ref
-              await github.rest.git.createRef({
-                ...repo,
-                ref: `refs/heads/${newName}`,
-                sha: ref.object.sha
-              });
-
-              // 3) Delete the old ref
-              await github.rest.git.deleteRef({
-                ...repo,
-                ref: `heads/${oldName}`
-              });
-
-              core.info(`Created '${newName}' from '${oldName}' and deleted old ref`);
+              core.warning(`Rename API failed (${err.status || 'n/a'}): ${err.message}`);
             }
 
             core.setOutput('new_branch', newName);
-
