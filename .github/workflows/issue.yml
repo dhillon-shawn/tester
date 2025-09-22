@@ -1,0 +1,79 @@
+name: Create branch and draft pr for issues
+on:
+  issues:
+    types: [opened,assigned]
+
+permissions:
+  write-all
+
+jobs:
+  assign:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Check if issue has assignees
+        id: check
+        if: github.event.action == 'opened'
+        run: |
+                if [ "${{ toJson(github.event.issue.assignees) }}" = "[]" ]; then
+                  echo "Issue has no assignees."
+                  echo "has_assignees=false" >> $GITHUB_OUTPUT
+                else
+                  echo "Issue has assignees."
+                  echo "has_assignees=true" >> $GITHUB_OUTPUT
+                fi
+
+
+      - name: 'Auto-assign issue'
+        uses: pozil/auto-assign-issue@v2
+        if: steps.check.outputs.has_assignees == 'false' && github.event.action == 'opened'
+        with:
+                  assignees: '${{ github.event.issue.user.login }}'
+                  numOfAssignee: 1
+
+      - name: Create Issue Branch
+        uses: robvanderleek/create-issue-branch@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assign PR to issue author
+        if: github.event.action == 'opened'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue;
+
+            const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
+            const prefix = labels.includes('hotfix') ? 'hotfix/' : 'feature/';
+
+            function sanitizeTitleForBranch(title) {
+              const s = title
+                .toLowerCase()
+                .replace(/ /g, '_')                         
+                .split('')                                     
+                .map(ch => /[a-z0-9_\/\-\$%#!&]/.test(ch) ? ch : '')
+                .join('');
+              return s.replace(/_+/g, '_');
+            }
+
+            const tail = `${issue.number}-${sanitizeTitleForBranch(issue.title)}`;
+            const head = `${prefix}${tail}`;
+
+            const { data: prs } = await github.rest.pulls.list({
+              owner, repo, state: 'open', head: `${owner}:${head}`
+            });
+
+            if (!prs.length) {
+              core.info(`No open PR found for ${head}; skipping PR assignment.`);
+              return;
+            }
+
+            const prNumber = prs[0].number;
+            const assignee = issue.user.login; // same person you auto-assigned on the issue
+
+            await github.rest.issues.addAssignees({
+              owner, repo, issue_number: prNumber, assignees: [assignee]
+            });
+
+            core.info(`Assigned PR #${prNumber} to @${assignee}`);

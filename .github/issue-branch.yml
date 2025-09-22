@@ -1,0 +1,21 @@
+mode: immediate
+openDraftPR: true
+copyIssueDescriptionToPR: true
+copyIssueLabelsToPR: true
+copyIssueAssigneeToPR: true
+copyIssueProjectsToPR: true
+autoCloseIssue: true
+autoDeleteBranch: true
+conventionalPrTitles: true
+branchName: '${issue.number}-${issue.title}'
+commentMessage: 'Created branch `${branchName}` from `${defaultBranch}` and opened a draft PR.'
+
+branches:
+  - label: feature
+    prefix: feature/
+
+  - label: hotfix
+    prefix: hotfix/
+
+
+
