@@ -126,19 +126,52 @@ jobs:
             core.setOutput('pr_url', pr.html_url);
 
       # Rename the branch to match the actual PR number
-      - name: Rename branch to PR-numbered name
+      - name: Rename branch to PR-numbered name (with fallback)
         id: rename
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const mode = '${{ steps.issue.outputs.mode }}';
+            const mode = '${{ steps.issue.outputs.mode }}';          // "feature" | "hotfix"
             const slug = '${{ steps.meta.outputs.slug }}';
-            const oldName = '${{ steps.meta.outputs.tmpBranch }}';
-            const newName = `${mode}/${${{ steps.createpr.outputs.pr_number }} }-${slug}`.replace('  ', ' ');
-            // PATCH /repos/{owner}/{repo}/branches/{branch}
-            await github.request('PATCH /repos/{owner}/{repo}/branches/{branch}', {
-              owner: repo.owner, repo: repo.repo, branch: oldName,
-              new_name: newName
-            });
+            const oldName = '${{ steps.meta.outputs.tmpBranch }}';   // e.g. feature/tmp-26-foo
+            const prNumber = Number('${{ steps.createpr.outputs.pr_number }}');
+            const newName = `${mode}/${prNumber}-${slug}`;
+
+            // Try the official rename endpoint first
+            try {
+              await github.request('POST /repos/{owner}/{repo}/branches/{branch}/rename', {
+                owner: repo.owner,
+                repo: repo.repo,
+                branch: oldName,     // branch name without refs/heads/
+                new_name: newName
+              });
+              core.info(`Renamed branch '${oldName}' → '${newName}'`);
+            } catch (err) {
+              core.warning(`Rename API failed (${err.status || 'n/a'}): ${err.message}. Falling back to ref create/delete…`);
+
+              // Fallback: create refs/heads/newName at the same SHA and delete the old ref
+              // 1) Get the current SHA of the old branch
+              const { data: ref } = await github.rest.git.getRef({
+                ...repo,
+                ref: `heads/${oldName}`
+              });
+
+              // 2) Create the new ref
+              await github.rest.git.createRef({
+                ...repo,
+                ref: `refs/heads/${newName}`,
+                sha: ref.object.sha
+              });
+
+              // 3) Delete the old ref
+              await github.rest.git.deleteRef({
+                ...repo,
+                ref: `heads/${oldName}`
+              });
+
+              core.info(`Created '${newName}' from '${oldName}' and deleted old ref`);
+            }
+
             core.setOutput('new_branch', newName);
+
