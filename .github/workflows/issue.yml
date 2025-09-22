@@ -120,6 +120,7 @@ jobs:
 
       - name: Rename branch to PR-numbered name
         id: rename
+        if: false
         uses: actions/github-script@v7
         with:
           script: |
