@@ -22,6 +22,7 @@ jobs:
       sha:   ${{ steps.check.outputs.sha }}
       rc_tag:     ${{ steps.check.outputs.rc_tag }}
       pr_num:  ${{ steps.check.outputs.pr_num }}
+      promote: ${{ steps.check.outputs.promote }}
     steps:
       - name: set target_env and decide skip
         id: check
@@ -30,7 +31,7 @@ jobs:
 
   stage:
     needs: pre-check
-    if: needs.pre-check.outputs.target_env != '' && needs.pre-check.outputs.target_env != 'prod'
+    if: ${{ needs.precheck.outputs.promote == 'false' && needs.precheck.outputs.target_env != '' }}
     uses: dhillon-shawn/Local-Uipath-CICD/.github/workflows/pipeline.yml@main
     secrets: inherit
     with:
@@ -41,9 +42,10 @@ jobs:
 
   rc-promotion:
     needs: pre-check
-    if: needs.pre-check.outputs.target_env == 'prod'
+    if: needs.precheck.outputs.promote == 'true'
     uses: dhillon-shawn/Local-Uipath-CICD/.github/workflows/promote-rc.yml@main
     secrets: inherit
     with:
       rc_tag: ${{ needs.pre-check.outputs.rc_tag }}
       pr_num: ${{ needs.pre-check.outputs.pr_num }}
+      target_env: ${{ needs.precheck.outputs.target_env }}
