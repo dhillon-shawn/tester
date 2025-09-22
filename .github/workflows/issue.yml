@@ -34,9 +34,7 @@ jobs:
   feature_branch_and_draft_pr:
     if: contains(join(github.event.issue.labels.*.name, ','), 'feature')
     runs-on: ubuntu-latest
-    concurrency:
-      group: feature-from-issue-${{ github.event.issue.number }}
-      cancel-in-progress: false
+    needs: assign
 
     steps:
       - name: Collect metadata
@@ -123,9 +121,7 @@ jobs:
     # Only when issue is opened AND has the "hotfix" label
     if: contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
     runs-on: ubuntu-latest
-    concurrency:
-      group: hotfix-from-issue-${{ github.event.issue.number }}
-      cancel-in-progress: false
+    needs: assign
 
     steps:
       - name: Collect metadata (default branch, next PR number, slug)
