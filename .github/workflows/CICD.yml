@@ -31,7 +31,7 @@ jobs:
 
   stage:
     needs: pre-check
-    if: ${{ needs.precheck.outputs.promote == 'false' && needs.precheck.outputs.target_env != '' }}
+    if: ${{ needs.pre-check.outputs.promote == 'false' && needs.pre-check.outputs.target_env != '' }}
     uses: dhillon-shawn/Local-Uipath-CICD/.github/workflows/pipeline.yml@main
     secrets: inherit
     with:
@@ -42,10 +42,10 @@ jobs:
 
   rc-promotion:
     needs: pre-check
-    if: needs.precheck.outputs.promote == 'true'
+    if: needs.pre-check.outputs.promote == 'true'
     uses: dhillon-shawn/Local-Uipath-CICD/.github/workflows/promote-rc.yml@main
     secrets: inherit
     with:
       rc_tag: ${{ needs.pre-check.outputs.rc_tag }}
       pr_num: ${{ needs.pre-check.outputs.pr_num }}
-      target_env: ${{ needs.precheck.outputs.target_env }}
+      target_env: ${{ needs.pre-check.outputs.target_env }}
