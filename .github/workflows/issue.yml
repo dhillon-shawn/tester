@@ -1,17 +1,24 @@
-name: Create branch and draft pr for issues
+name: Create branch and PR for issues
+
 on:
   issues:
     types: [opened]
 
-permissions: write-all
+permissions:
+  contents: write        # create/push branches
+  pull-requests: write   # open PRs and set labels/assignees/milestone
+  issues: write          # update issue (auto-assign)
 
 jobs:
-  assign:
+  issue_to_pr:
+    # Only run when the newly opened issue already has either label
     if: >
       contains(join(github.event.issue.labels.*.name, ','), 'feature') ||
       contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
     runs-on: ubuntu-latest
+
     steps:
+      # 1) Ensure the issue has an assignee (assign creator if none)
       - name: Check if issue has assignees
         id: check
         run: |
@@ -28,6 +35,7 @@ jobs:
           assignees: "${{ github.event.issue.user.login }}"
           numOfAssignee: 1
 
+      # 2) Re-fetch issue so we see the (possibly new) assignees
       - name: Refresh issue data
         id: issue
         uses: actions/github-script@v7
@@ -36,14 +44,18 @@ jobs:
             const repo = context.repo;
             const num = context.payload.issue.number;
             const { data: issue } = await github.rest.issues.get({ ...repo, issue_number: num });
+
+            const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
+            const mode = labels.includes('hotfix') ? 'hotfix' : 'feature';
+
             core.setOutput('title', issue.title || '');
             core.setOutput('body', issue.body || '');
-            core.setOutput('labels', JSON.stringify(issue.labels || []));
+            core.setOutput('labels', JSON.stringify(labels));
             core.setOutput('assignees', JSON.stringify((issue.assignees || []).map(a => a.login)));
             core.setOutput('milestone', issue.milestone ? String(issue.milestone.number) : '');
-            const names = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
-            core.setOutput('mode', names.includes('hotfix') ? 'hotfix' : 'feature');
+            core.setOutput('mode', mode);
 
+      # 3) Derive next PR number and branch name upfront (no rename later)
       - name: Derive metadata
         id: meta
         uses: actions/github-script@v7
@@ -51,36 +63,50 @@ jobs:
           script: |
             const mode = '${{ steps.issue.outputs.mode }}';
             const defaultBranch = context.payload.repository.default_branch;
+
+            // "Next PR number" = last PR number + 1 (simple by design)
+            const { data: prs } = await github.rest.pulls.list({
+              ...context.repo, state: 'all', per_page: 1, sort: 'created', direction: 'desc'
+            });
+            const nextPrNumber = (prs[0]?.number || 0) + 1;
+
+            // branch slug from title
             const rawTitle = ${{ toJson(steps.issue.outputs.title) }};
             const title = rawTitle || mode;
             const slug = title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,50) || mode;
-            const tmpBranch = `${mode}/tmp-${context.payload.issue.number}-${slug}`;
-            const isDraft = mode === 'feature';
-            const ccPrefix = isDraft ? 'feature: ' : 'hotfix: ';
-            core.setOutput('default', defaultBranch);
-            core.setOutput('tmpBranch', tmpBranch);
-            core.setOutput('slug', slug);
-            core.setOutput('isDraft', String(isDraft));
-            core.setOutput('ccPrefix', ccPrefix);
 
+            const branch = `${mode}/${nextPrNumber}-${slug}`;
+            const isDraft = mode === 'feature';
+            const prTitlePrefix = isDraft ? 'feat: ' : 'fix: ';
+
+            core.setOutput('default', defaultBranch);
+            core.setOutput('branch', branch);
+            core.setOutput('nextPr', String(nextPrNumber));
+            core.setOutput('isDraft', String(isDraft));
+            core.setOutput('prTitlePrefix', prTitlePrefix);
+            core.setOutput('slug', slug);
+
+      # 4) Create the branch at default tip and push a single empty commit
       - name: Check out default branch
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.meta.outputs.default }}
 
-      - name: Create temp branch and push empty commit
+      - name: Create branch and push empty commit
         env:
-          BRANCH: ${{ steps.meta.outputs.tmpBranch }}
+          BRANCH: ${{ steps.meta.outputs.branch }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           MODE: ${{ steps.issue.outputs.mode }}
         run: |
           set -eux
           git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git switch -c "$BRANCH"
-          git commit --allow-empty -m "init ${MODE} branch for #${ISSUE_NUMBER} [skip ci]"
+          git commit --allow-empty -m "chore: init ${MODE} branch for #${ISSUE_NUMBER} [skip ci]"
           git push --set-upstream origin "$BRANCH"
 
+      # 5) Open the PR and copy details (labels, milestone, assignees)
       - name: Open PR and copy details
         id: createpr
         uses: actions/github-script@v7
@@ -89,9 +115,10 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.issue.number;
             const base = '${{ steps.meta.outputs.default }}';
-            const head = '${{ steps.meta.outputs.tmpBranch }}';
+            const head = '${{ steps.meta.outputs.branch }}';
             const isDraft = '${{ steps.meta.outputs.isDraft }}' === 'true';
-            const title = '${{ steps.meta.outputs.ccPrefix }}' + ${{ toJson(steps.issue.outputs.title) }};
+
+            const title = '${{ steps.meta.outputs.prTitlePrefix }}' + ${{ toJson(steps.issue.outputs.title) }};
             const body = [
               `${isDraft ? 'Draft PR' : 'PR'} for issue #${issue_number}`,
               '',
@@ -101,46 +128,27 @@ jobs:
               ${{ toJson(steps.issue.outputs.body) }}
             ].join('\n');
 
-            const { data: pr } = await github.rest.pulls.create({ ...repo, title, head, base, body, draft: isDraft });
+            const { data: pr } = await github.rest.pulls.create({
+              ...repo, title, head, base, body, draft: isDraft
+            });
 
-            const labels = JSON.parse('${{ steps.issue.outputs.labels }}').map(l => typeof l === 'string' ? l : l.name);
-            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
+            // Labels
+            const labels = JSON.parse('${{ steps.issue.outputs.labels }}');
+            if (labels.length) {
+              await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
+            }
 
-
+            // Milestone
             const milestone = '${{ steps.issue.outputs.milestone }}';
-            if (milestone) await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
+            if (milestone) {
+              await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
+            }
 
-
+            // Assignees: if issue has any, use them; else assign the issue creator
             const refreshedAssignees = JSON.parse('${{ steps.issue.outputs.assignees }}');
             const finalAssignees = refreshedAssignees.length ? refreshedAssignees : ['${{ github.event.issue.user.login }}'];
             await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: finalAssignees });
 
             core.setOutput('pr_number', String(pr.number));
-            core.setOutput('pr_url', pr.html_url);
+            core.setOutput('pr_url', pr.html_url)
 
-      - name: Rename branch to PR-numbered name
-        id: rename
-        if: false
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const repo = context.repo;
-            const mode = '${{ steps.issue.outputs.mode }}';         
-            const slug = '${{ steps.meta.outputs.slug }}';
-            const oldName = '${{ steps.meta.outputs.tmpBranch }}';  
-            const prNumber = Number('${{ steps.createpr.outputs.pr_number }}');
-            const newName = `${mode}/${prNumber}-${slug}`;
-
-            try {
-              await github.request('POST /repos/{owner}/{repo}/branches/{branch}/rename', {
-                owner: repo.owner,
-                repo: repo.repo,
-                branch: oldName,     
-                new_name: newName
-              });
-              core.info(`Renamed branch '${oldName}' -> '${newName}'`);
-            } catch (err) {
-              core.warning(`Rename API failed (${err.status || 'n/a'}): ${err.message}`);
-            }
-
-            core.setOutput('new_branch', newName);
