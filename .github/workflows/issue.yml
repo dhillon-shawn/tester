@@ -30,183 +30,117 @@ jobs:
         with:
                   assignees: '${{ github.event.issue.user.login }}'
                   numOfAssignee: 1
-
-  feature_branch_and_draft_pr:
-    if: contains(join(github.event.issue.labels.*.name, ','), 'feature')
-    runs-on: ubuntu-latest
-    needs: assign
-
-    steps:
-      - name: Collect metadata
-        id: meta
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { issue, repository } = context.payload;
-            const defaultBranch = repository.default_branch;
-            const slug = (issue.title || 'feature')
-              .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0,50) || 'feature';
-            const branch = `feature/issue-${issue.number}-${slug}`;
-            core.setOutput('default', defaultBranch);
-            core.setOutput('branch', branch);
-
-      - name: Check out default branch
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.meta.outputs.default }}
-          # default fetch-depth (1) is plenty; we just need the tip to branch from
-
-      - name: Create feature branch and push empty commit
-        env:
-          BRANCH: ${{ steps.meta.outputs.branch }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-        run: |
-          set -eux
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$BRANCH"
-          git commit --allow-empty -m "chore: init feature branch for #${ISSUE_NUMBER}"
-          git push --set-upstream origin "$BRANCH"
-
-      - name: Open draft PR and copy labels/assignees/milestone
-        id: createpr
+                  
+      - name: Refresh issue data
+        id: issue
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const issue = context.payload.issue;
-            const base = '${{ steps.meta.outputs.default }}';
-            const head = '${{ steps.meta.outputs.branch }}';
+            const num = context.payload.issue.number;
+            const { data: issue } = await github.rest.issues.get({ ...repo, issue_number: num });
+            core.setOutput('title', issue.title || '');
+            core.setOutput('body', issue.body || '');
+            core.setOutput('labels', JSON.stringify(issue.labels || []));
+            core.setOutput('assignees', JSON.stringify((issue.assignees || []).map(a => a.login)));
+            core.setOutput('milestone', issue.milestone ? String(issue.milestone.number) : '');
+            core.setOutput('hasFeature', String((issue.labels || []).some(l => (typeof l === 'string' ? l : l.name) === 'feature')));
+            core.setOutput('hasHotfix', String((issue.labels || []).some(l => (typeof l === 'string' ? l : l.name) === 'hotfix')));
 
-            const body = [
-              `Draft PR for issue #${issue.number}`,
-              '',
-              `Closes #${issue.number}`,
-              '',
-              '---',
-              issue.body || ''
-            ].join('\n');
-
-            const { data: pr } = await github.rest.pulls.create({
-              ...repo,
-              title: `feat: ${issue.title}`,
-              head, base, body,
-              draft: true
-            });
-
-            const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
-            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
-
-            const assignees = (issue.assignees || []).map(a => a.login);
-            if (assignees.length) await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees });
-
-            if (issue.milestone) {
-              await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: issue.milestone.number });
-            }
-
-            core.setOutput('pr_url', pr.html_url);
-
-      - name: Comment back on the issue (optional)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              ...context.repo,
-              issue_number: context.payload.issue.number,
-              body: `✅ Opened draft PR: ${{ steps.createpr.outputs.pr_url }}`
-            })
-
-# --- HOTFIX PATH ------------------------------------------------------------
-  hotfix_branch_and_pr:
-    # Only when issue is opened AND has the "hotfix" label
-    if: contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
-    runs-on: ubuntu-latest
-    needs: assign
-
-    steps:
-      - name: Collect metadata (default branch, next PR number, slug)
+      # --- 2) Collect metadata (default, next PR#, branch name, draft flag) ---
+      - name: Derive branch & PR metadata
         id: meta
         uses: actions/github-script@v7
         with:
           script: |
-            const { issue, repository } = context.payload;
+            const { repository } = context.payload;
             const defaultBranch = repository.default_branch;
 
-            // Next PR number = last PR number + 1 (simple, race-prone but requested)
+            // Next PR number = last PR number + 1 (simple by design)
             const { data: prs } = await github.rest.pulls.list({
               ...context.repo, state: 'all', per_page: 1, sort: 'created', direction: 'desc'
             });
             const nextPrNumber = (prs[0]?.number || 0) + 1;
 
-            const slug = (issue.title || 'hotfix')
-              .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0,50) || 'hotfix';
+            // Decide mode (feature vs hotfix) from refreshed labels
+            const hasFeature = ${{ steps.issue.outputs.hasFeature == 'true' && 'true' || 'false' }};
+            const hasHotfix = ${{ steps.issue.outputs.hasHotfix == 'true' && 'true' || 'false' }};
+            const mode = hasFeature === true ? 'feature' : (hasHotfix === true ? 'hotfix' : null);
+            if (!mode) { core.setFailed('Issue has neither feature nor hotfix label.'); return; }
 
-            const branch = `hotfix/${nextPrNumber}-${slug}`;
+            const rawTitle = `${{ toJson(steps.issue.outputs.title) }}`.slice(1,-1); // dequote
+            const slug = (rawTitle || mode)
+              .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50) || mode;
+
+            const branch = `${mode}/${nextPrNumber}-${slug}`;
+            const isDraft = mode === 'feature'; // feature => draft, hotfix => regular
 
             core.setOutput('default', defaultBranch);
             core.setOutput('branch', branch);
+            core.setOutput('nextPr', String(nextPrNumber));
+            core.setOutput('mode', mode);
+            core.setOutput('isDraft', String(isDraft));
 
+      # --- 3) Create and push the branch (shallow checkout is fine) ---
       - name: Check out default branch
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.meta.outputs.default }}
 
-      - name: Create hotfix branch and push empty commit
+      - name: Create branch and push empty commit
         env:
           BRANCH: ${{ steps.meta.outputs.branch }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          MODE: ${{ steps.meta.outputs.mode }}
         run: |
           set -eux
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git commit --allow-empty -m "chore: init hotfix branch for #${ISSUE_NUMBER}"
+          git commit --allow-empty -m "chore: init ${MODE} branch for #${ISSUE_NUMBER} [skip ci]"
           git push --set-upstream origin "$BRANCH"
 
-      - name: Open PR and copy labels/assignees/milestone
+      # --- 4) Open PR and copy labels/milestone/assignees (from REFRESHED issue) ---
+      - name: Open PR and copy details
         id: createpr
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const issue = context.payload.issue;
+            const issue_number = context.payload.issue.number;
             const base = '${{ steps.meta.outputs.default }}';
             const head = '${{ steps.meta.outputs.branch }}';
+            const isDraft = '${{ steps.meta.outputs.isDraft }}' === 'true';
 
+            const title = (isDraft ? 'feat: ' : 'fix: ') + ${{ toJson(steps.issue.outputs.title) }};
             const body = [
-              `PR for hotfix issue #${issue.number}`,
+              `${isDraft ? 'Draft PR' : 'PR'} for issue #${issue_number}`,
               '',
-              `Closes #${issue.number}`,
+              `Closes #${issue_number}`,
               '',
               '---',
-              issue.body || ''
+              ${{ toJson(steps.issue.outputs.body) }}
             ].join('\n');
 
             const { data: pr } = await github.rest.pulls.create({
               ...repo,
-              title: `fix: ${issue.title}`,
-              head, base, body,
-              draft: false
+              title, head, base, body,
+              draft: isDraft
             });
 
-            const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
+            // Labels
+            const labels = JSON.parse('${{ steps.issue.outputs.labels }}').map(l => typeof l === 'string' ? l : l.name);
             if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
 
-            const assignees = (issue.assignees || []).map(a => a.login);
-            if (assignees.length) await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees });
-
-            if (issue.milestone) {
-              await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: issue.milestone.number });
+            // Milestone
+            const milestone = '${{ steps.issue.outputs.milestone }}';
+            if (milestone) {
+              await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
             }
 
-            core.setOutput('pr_url', pr.html_url);
+            // Assignees: use refreshed issue's assignees; if still none, assign creator
+            const refreshedAssignees = JSON.parse('${{ steps.issue.outputs.assignees }}');
+            const finalAssignees = refreshedAssignees.length ? refreshedAssignees : ['${{ github.event.issue.user.login }}'];
+            await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: finalAssignees });
 
-      - name: Comment back on the issue (optional)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              ...context.repo,
-              issue_number: context.payload.issue.number,
-              body: `🚑 Opened hotfix PR: ${{ steps.createpr.outputs.pr_url }}`
-            })
+            core.setOutput('url', pr.html_url)
