@@ -1,0 +1,166 @@
+name: Rollback when issue is reopened
+
+on:
+  issues:
+    types: [reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  rollback:
+    # Only run if the reopened item is a real Issue and has either label
+    if: >
+      (contains(join(github.event.issue.labels.*.name, ','), 'feature') ||
+       contains(join(github.event.issue.labels.*.name, ','), 'hotfix'))
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Refresh issue & find merged PR that closed it
+        id: find
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const issueNumber = context.payload.issue.number;
+
+            // 1) Refresh the issue (assignees/labels may have changed)
+            const { data: issue } = await github.rest.issues.get({ ...repo, issue_number: issueNumber });
+
+            // 2) Find the merged PR that closed this issue (we always wrote "Closes #<n>" into PR body)
+            const q = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${issueNumber}"`;
+            const search = await github.rest.search.issuesAndPullRequests({ q, per_page: 1, sort: 'updated', order: 'desc' });
+            if (!search.data.items.length) {
+              core.setFailed(`No merged PR found that explicitly closes #${issueNumber}.`);
+              return;
+            }
+            const prNumber = search.data.items[0].number;
+
+            // 3) Load the PR for details (merge SHA, original head ref, title)
+            const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: prNumber });
+            if (!pr.merged) {
+              core.setFailed(`PR #${prNumber} is not merged; nothing to revert.`);
+              return;
+            }
+
+            core.setOutput('prNumber', String(pr.number));
+            core.setOutput('mergeSha', pr.merge_commit_sha);
+            core.setOutput('origHeadRef', pr.head.ref);           // e.g., feature/123-foo
+            core.setOutput('default', context.payload.repository.default_branch);
+            core.setOutput('issueTitle', issue.title || '');
+            core.setOutput('issueBody', issue.body || '');
+            core.setOutput('labels', JSON.stringify((issue.labels || []).map(l => typeof l === 'string' ? l : l.name)));
+            core.setOutput('assignees', JSON.stringify((issue.assignees || []).map(a => a.login)));
+            core.setOutput('milestone', issue.milestone ? String(issue.milestone.number) : '');
+
+      - name: Derive branch names
+        id: meta
+        run: |
+          set -e
+          # Safe slug from issue title (purely cosmetic for the revert branch)
+          title='${{ steps.find.outputs.issueTitle }}'
+          slug=$(printf "%s" "$title" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g; s/^$|^$/revert/')
+          echo "revert_branch=revert/pr-${{ steps.find.outputs.prNumber }}-$slug" >> $GITHUB_OUTPUT
+
+      - name: Check out default
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.find.outputs.default }}
+
+      - name: Create revert branch & revert the merge
+        env:
+          REVERT_BRANCH: ${{ steps.meta.outputs.revert_branch }}
+          MERGE_SHA: ${{ steps.find.outputs.mergeSha }}
+        run: |
+          set -eux
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git switch -c "$REVERT_BRANCH"
+
+          # Detect if MERGE_SHA is a merge commit (>=2 parents) and revert appropriately
+          parents=$(git cat-file -p "$MERGE_SHA" | grep -c '^parent ' || true)
+          if [ "${parents:-0}" -ge 2 ]; then
+            git revert -m 1 "$MERGE_SHA" --no-edit
+          else
+            git revert "$MERGE_SHA" --no-edit
+          fi
+
+          git push --set-upstream origin "$REVERT_BRANCH"
+
+      - name: Open revert PR and copy labels/assignees/milestone
+        id: openpr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const base = '${{ steps.find.outputs.default }}';
+            const head = '${{ steps.meta.outputs.revert_branch }}';
+            const prNumber = Number('${{ steps.find.outputs.prNumber }}');
+            const issueNumber = context.payload.issue.number;
+
+            const title = `revert: PR #${prNumber} – ${{ toJson(steps.find.outputs.issueTitle) }}`;
+            const body = [
+              `Reverts merge from PR #${prNumber} (triggered by reopened issue #${issueNumber}).`,
+              '',
+              `Reverts commit: \`${{ steps.find.outputs.mergeSha }}\``,
+              '',
+              `Context: issue #${issueNumber} was reopened.`,
+              '',
+              '---',
+              ${{ toJson(steps.find.outputs.issueBody) }}
+            ].join('\n');
+
+            const { data: pr } = await github.rest.pulls.create({ ...repo, title, head, base, body, draft: false });
+
+            // Copy labels already on the issue (avoid inventing new labels that might not exist)
+            const labels = JSON.parse('${{ steps.find.outputs.labels }}');
+            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
+
+            // Copy milestone if any
+            const milestone = '${{ steps.find.outputs.milestone }}';
+            if (milestone) await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
+
+            // Assignees: if issue has any, use them; else assign the issue creator
+            const assignees = JSON.parse('${{ steps.find.outputs.assignees }}');
+            const fallback = ['${{ github.event.issue.user.login }}'];
+            await github.rest.issues.addAssignees({
+              ...repo, issue_number: pr.number, assignees: assignees.length ? assignees : fallback
+            });
+
+            core.setOutput('revert_pr_url', pr.html_url);
+
+      - name: Recreate original working branch (if deleted)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const defaultRef = 'heads/${{ steps.find.outputs.default }}';
+            const newRef = 'refs/heads/${{ steps.find.outputs.origHeadRef }}';
+
+            // Get current default branch SHA
+            const { data: def } = await github.rest.git.getRef({ ...repo, ref: defaultRef });
+
+            // Try to create the old branch name at default's current tip.
+            // If it already exists (422), that's fine—no-op.
+            try {
+              await github.rest.git.createRef({ ...repo, ref: newRef, sha: def.object.sha });
+            } catch (e) {
+              if (e.status === 422) {
+                // Reference already exists; leave it as-is.
+              } else {
+                throw e;
+              }
+            }
+
+      - name: Comment link on the issue (optional)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.issue.number,
+              body: `🔁 Opened revert PR: ${{ steps.openpr.outputs.revert_pr_url }}\nRecreated branch \`${{ steps.find.outputs.origHeadRef }}\` from current \`${{ steps.find.outputs.default }}\`.`
+            })
