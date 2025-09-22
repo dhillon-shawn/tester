@@ -5,12 +5,10 @@ on:
     types: [opened]
 
 permissions:
-  contents: write        # create/push branches
-  pull-requests: write   # open PRs and set labels/assignees/milestone
-  issues: write          # update issue (auto-assign)
+  contents: write
+  pull-requests: write
+  issues: write
 
-# Concurrency gate around "next PR number" allocation.
-# If two issues open at once, the newer run will cancel the older one (acts like "fail one").
 concurrency:
   group: pr-number-allocator
   cancel-in-progress: true
@@ -23,25 +21,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Ensure the issue has an assignee (assign creator if none)
-      - name: Check if issue has assignees
+      - name: assign check
         id: check
         run: |
+          echo "issue_number=${{ github.event.issue.number }}"
+          echo "assignees_json=${{ toJson(github.event.issue.assignees) }}"
           if [ "${{ toJson(github.event.issue.assignees) }}" = "[]" ]; then
             echo "has_assignees=false" >> $GITHUB_OUTPUT
+            echo "result=no current assignee"
           else
             echo "has_assignees=true" >> $GITHUB_OUTPUT
+            echo "result=already assigned"
           fi
 
-      - name: Auto-assign issue (to creator if none)
+      - name: assign ensure
         if: steps.check.outputs.has_assignees == 'false'
         uses: pozil/auto-assign-issue@v2
         with:
           assignees: "${{ github.event.issue.user.login }}"
           numOfAssignee: 1
 
-      # 2) Re-fetch issue so we see the (possibly new) assignees
-      - name: Refresh issue data
+      - name: issue refresh
         id: issue
         uses: actions/github-script@v7
         with:
@@ -49,10 +49,9 @@ jobs:
             const repo = context.repo;
             const num = context.payload.issue.number;
             const { data: issue } = await github.rest.issues.get({ ...repo, issue_number: num });
-
             const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
             const mode = labels.includes('hotfix') ? 'hotfix' : 'feature';
-
+            core.info(`issue: #${num} | mode=${mode} | labels=[${labels.join(', ')}] | assignees=[${(issue.assignees||[]).map(a=>a.login).join(', ')}]`);
             core.setOutput('title', issue.title || '');
             core.setOutput('body', issue.body || '');
             core.setOutput('labels', JSON.stringify(labels));
@@ -60,83 +59,49 @@ jobs:
             core.setOutput('milestone', issue.milestone ? String(issue.milestone.number) : '');
             core.setOutput('mode', mode);
 
-      # 3) Derive "next PR number" and branch name (with logging)
-      - name: Derive metadata (robust next PR number + logging)
+      - name: meta derive
         id: meta
         uses: actions/github-script@v7
         with:
           script: |
-            const mode = '${{ steps.issue.outputs.mode }}';
+            const issueNum = context.payload.issue.number;
+            const nextPrNumber = issueNum + 1;
             const defaultBranch = context.payload.repository.default_branch;
-
-            // Fetch a handful of PRs and take the max(number) to guard against odd sort artifacts
-            // (imports/backfills/clock skew). We also log what we saw.
-            const pageSize = 50; // small + fast
-            const { data: prs } = await github.rest.pulls.list({
-              ...context.repo, state: 'all', per_page: pageSize, sort: 'created', direction: 'desc'
-            });
-
-            const numbers = prs.map(p => p.number);
-            const lastPrNumber = numbers.length ? Math.max(...numbers) : 0;
-            const nextPrNumber = lastPrNumber + 1;
-
-            // Build slug & branch
+            const mode = '${{ steps.issue.outputs.mode }}';
             const rawTitle = ${{ toJson(steps.issue.outputs.title) }};
             const title = rawTitle || mode;
             const slug = title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,50) || mode;
-
             const branch = `${mode}/${nextPrNumber}-${slug}`;
             const isDraft = mode === 'feature';
-            const prTitlePrefix = isDraft ? 'feat: ' : 'fix: ';
-
-            core.info(`PR numbering: observed=${numbers.slice(0,10).join(', ') || '(none)'}`);
-            core.info(`Chosen next PR number: ${nextPrNumber} (max=${lastPrNumber} + 1)`);
-            core.info(`Branch to create: ${branch}`);
-            core.info(`Default branch: ${defaultBranch} | Mode: ${mode} | Draft: ${isDraft}`);
-
+            const prefix = isDraft ? 'feat: ' : 'fix: ';
+            core.info(`meta: issue=${issueNum} -> planned_pr=${nextPrNumber} | mode=${mode} | draft=${isDraft} | branch=${branch} | default=${defaultBranch}`);
             core.setOutput('default', defaultBranch);
             core.setOutput('branch', branch);
-            core.setOutput('nextPr', String(nextPrNumber));
+            core.setOutput('plannedPr', String(nextPrNumber));
             core.setOutput('isDraft', String(isDraft));
-            core.setOutput('prTitlePrefix', prTitlePrefix);
+            core.setOutput('prefix', prefix);
             core.setOutput('slug', slug);
 
-      - name: Verify PR number vs planned (log only)
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const planned = Number('${{ steps.meta.outputs.nextPr }}');
-            const actual  = Number('${{ steps.createpr.outputs.pr_number }}');
-            if (planned !== actual) {
-              core.warning(`Planned PR number was ${planned}, but GitHub assigned ${actual}. `
-                + `Branch remains '${{ steps.meta.outputs.branch }}' (no rename per design).`);
-            } else {
-              core.info(`PR number matched plan: ${actual}.`);
-            }
-
-
-      # 4) Create the branch at default tip and push a single empty commit
-      - name: Check out default branch
+      - name: checkout default
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.meta.outputs.default }}
 
-      - name: Create branch and push empty commit
+      - name: branch init
         env:
           BRANCH: ${{ steps.meta.outputs.branch }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           MODE: ${{ steps.issue.outputs.mode }}
         run: |
-          set -eux
+          echo "creating branch=$BRANCH from default=${{ steps.meta.outputs.default }} for issue #$ISSUE_NUMBER mode=$MODE"
           git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git commit --allow-empty -m "chore: init ${MODE} branch for #${ISSUE_NUMBER} [skip ci]"
+          git commit --allow-empty -m "chore: init $MODE branch for #$ISSUE_NUMBER [skip ci]"
           git push --set-upstream origin "$BRANCH"
+          echo "pushed branch=$BRANCH"
 
-      # 5) Open the PR and copy details (labels, milestone, assignees)
-      - name: Open PR and copy details
+      - name: pr open
         id: createpr
         uses: actions/github-script@v7
         with:
@@ -146,8 +111,7 @@ jobs:
             const base = '${{ steps.meta.outputs.default }}';
             const head = '${{ steps.meta.outputs.branch }}';
             const isDraft = '${{ steps.meta.outputs.isDraft }}' === 'true';
-
-            const title = '${{ steps.meta.outputs.prTitlePrefix }}' + ${{ toJson(steps.issue.outputs.title) }};
+            const title = '${{ steps.meta.outputs.prefix }}' + ${{ toJson(steps.issue.outputs.title) }};
             const body = [
               `${isDraft ? 'Draft PR' : 'PR'} for issue #${issue_number}`,
               '',
@@ -156,38 +120,10 @@ jobs:
               '---',
               ${{ toJson(steps.issue.outputs.body) }}
             ].join('\n');
-
-            const { data: pr } = await github.rest.pulls.create({
-              ...repo, title, head, base, body, draft: isDraft
-            });
-
-            // Labels
+            const { data: pr } = await github.rest.pulls.create({ ...repo, title, head, base, body, draft: isDraft });
             const labels = JSON.parse('${{ steps.issue.outputs.labels }}');
-            if (labels.length) {
-              await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
-            }
-
-            // Milestone
+            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
             const milestone = '${{ steps.issue.outputs.milestone }}';
-            if (milestone) {
-              await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
-            }
-
-            // Assignees: if issue has any, use them; else assign the issue creator
-            const refreshedAssignees = JSON.parse('${{ steps.issue.outputs.assignees }}');
-            const finalAssignees = refreshedAssignees.length ? refreshedAssignees : ['${{ github.event.issue.user.login }}'];
-            await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: finalAssignees });
-
-            core.setOutput('pr_number', String(pr.number));
-            core.setOutput('pr_url', pr.html_url);
-
-      # (Optional) Comment back on the issue with the PR link
-      - name: Comment PR link on the issue (optional)
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              ...context.repo,
-              issue_number: context.payload.issue.number,
-              body: `✅ Opened ${'${{ steps.issue.outputs.mode }}' === 'feature' ? 'draft ' : ''}PR: ${{ steps.createpr.outputs.pr_url }}\nBranch: \`${{ steps.meta.outputs.branch }}\``
-            })
+            if (milestone) await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
+            const assignees = JSON.parse('${{ steps.issue.outputs.assignees }}');
+            const finalAssignees = assignees.length ? assignees : ['${{ github.event.issue.user.login }}']
