@@ -1,4 +1,4 @@
-name: Rollback when issue is reopened
+name: Rollback on issue reopen
 
 on:
   issues:
@@ -11,14 +11,14 @@ permissions:
 
 jobs:
   rollback:
-    # Only run if the reopened item is a real Issue and has either label
     if: >
+      !contains(toJson(github.event.issue), '"pull_request"') &&
       (contains(join(github.event.issue.labels.*.name, ','), 'release') ||
        contains(join(github.event.issue.labels.*.name, ','), 'hotfix'))
     runs-on: ubuntu-latest
 
     steps:
-      - name: Refresh issue & find merged PR that closed it
+      - name: resolve pr + release
         id: find
         uses: actions/github-script@v7
         with:
@@ -26,61 +26,81 @@ jobs:
             const repo = context.repo;
             const issueNumber = context.payload.issue.number;
 
-            // 1) Refresh the issue (assignees/labels may have changed)
             const { data: issue } = await github.rest.issues.get({ ...repo, issue_number: issueNumber });
 
-            // 2) Find the merged PR that closed this issue (we always wrote "Closes #<n>" into PR body)
             const q = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${issueNumber}"`;
-            const search = await github.rest.search.issuesAndPullRequests({ q, per_page: 1, sort: 'updated', order: 'desc' });
-            if (!search.data.items.length) {
-              core.setFailed(`No merged PR found that explicitly closes #${issueNumber}.`);
+            const res = await github.rest.search.issuesAndPullRequests({ q, per_page: 1, sort: 'updated', order: 'desc' });
+            if (!res.data.items.length) {
+              core.setFailed(`no merged PR found that closes #${issueNumber}`);
               return;
             }
-            const prNumber = search.data.items[0].number;
-
-            // 3) Load the PR for details (merge SHA, original head ref, title)
+            const prNumber = res.data.items[0].number;
             const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: prNumber });
             if (!pr.merged) {
-              core.setFailed(`PR #${prNumber} is not merged; nothing to revert.`);
+              core.setFailed(`PR #${prNumber} is not merged`);
               return;
             }
 
-            core.setOutput('prNumber', String(pr.number));
-            core.setOutput('mergeSha', pr.merge_commit_sha);
-            core.setOutput('origHeadRef', pr.head.ref);          
-            core.setOutput('default', context.payload.repository.default_branch);
+            core.info(`issue=#${issueNumber} pr=#${pr.number} base=${pr.base.ref} default=${context.payload.repository.default_branch} merge_sha=${pr.merge_commit_sha} head_sha=${pr.head.sha} head_ref=${pr.head.ref}`);
+
+            // read release rc-pr-<prNumber> and rc-meta.json if present
+            let rcMeta = null;
+            try {
+              const tag = `rc-pr-${pr.number}`;
+              const rel = await github.request('GET /repos/{owner}/{repo}/releases/tags/{tag}', {
+                owner: repo.owner, repo: repo.repo, tag
+              });
+              const asset = (rel.data.assets || []).find(a => a.name === 'rc-meta.json');
+              if (asset) {
+                const bin = await github.request('GET ' + asset.url, {
+                  headers: { Accept: 'application/octet-stream' }
+                });
+                rcMeta = JSON.parse(Buffer.from(bin.data).toString('utf8'));
+                core.info(`release rc-pr-${pr.number}: version=${rcMeta.version} commit=${rcMeta.commit} package=${rcMeta.package}`);
+              } else {
+                core.warning(`rc-meta.json not found on release rc-pr-${pr.number}`);
+              }
+            } catch (e) {
+              core.warning(`release lookup failed: ${e.status || 'n/a'} ${e.message}`);
+            }
+
+            const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
+            const assignees = (issue.assignees || []).map(a => a.login);
+            const milestone = issue.milestone ? issue.milestone.number : null;
+
             core.setOutput('issueTitle', issue.title || '');
             core.setOutput('issueBody', issue.body || '');
-            core.setOutput('labels', JSON.stringify((issue.labels || []).map(l => typeof l === 'string' ? l : l.name)));
-            core.setOutput('assignees', JSON.stringify((issue.assignees || []).map(a => a.login)));
-            core.setOutput('milestone', issue.milestone ? String(issue.milestone.number) : '');
+            core.setOutput('labels', JSON.stringify(labels));
+            core.setOutput('assignees', JSON.stringify(assignees));
+            core.setOutput('milestone', milestone !== null ? String(milestone) : '');
+            core.setOutput('prNumber', String(pr.number));
+            core.setOutput('mergeSha', pr.merge_commit_sha || '');
+            core.setOutput('baseRef', pr.base.ref);
+            core.setOutput('defaultBranch', context.payload.repository.default_branch);
+            core.setOutput('headSha', pr.head.sha || '');
+            core.setOutput('headRef', pr.head.ref || '');
+            core.setOutput('rcMeta', JSON.stringify(rcMeta || {}));
 
-      - name: Derive branch names
-        id: meta
-        run: |
-          set -e
-          # Safe slug from issue title (purely cosmetic for the revert branch)
-          title='${{ steps.find.outputs.issueTitle }}'
-          slug=$(printf "%s" "$title" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g; s/^$|^$/revert/')
-          echo "revert_branch=revert/pr-${{ steps.find.outputs.prNumber }}-$slug" >> $GITHUB_OUTPUT
-
-      - name: Check out default
+      - name: checkout default
         uses: actions/checkout@v4
         with:
-          ref: ${{ steps.find.outputs.default }}
+          ref: ${{ steps.find.outputs.defaultBranch }}
 
-      - name: Create revert branch & revert the merge
+      - name: create revert branch and revert merge
+        id: revert
         env:
-          REVERT_BRANCH: ${{ steps.meta.outputs.revert_branch }}
+          PR_NUMBER: ${{ steps.find.outputs.prNumber }}
+          DEFAULT: ${{ steps.find.outputs.defaultBranch }}
           MERGE_SHA: ${{ steps.find.outputs.mergeSha }}
         run: |
           set -eux
+          slug="$(echo "${{ steps.find.outputs.issueTitle }}" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g; s/^$/revert/')"
+          BRANCH="revert/pr-${PR_NUMBER}-${slug}"
+          echo "branch=${BRANCH}" >> $GITHUB_OUTPUT
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
 
-          git switch -c "$REVERT_BRANCH"
-
-          # Detect if MERGE_SHA is a merge commit (>=2 parents) and revert appropriately
           parents=$(git cat-file -p "$MERGE_SHA" | grep -c '^parent ' || true)
           if [ "${parents:-0}" -ge 2 ]; then
             git revert -m 1 "$MERGE_SHA" --no-edit
@@ -88,79 +108,67 @@ jobs:
             git revert "$MERGE_SHA" --no-edit
           fi
 
-          git push --set-upstream origin "$REVERT_BRANCH"
+          git push --set-upstream origin "$BRANCH"
+          echo "revert_branch=$BRANCH default=$DEFAULT merge_sha=$MERGE_SHA"
 
-      - name: Open revert PR and copy labels/assignees/milestone
+      - name: open revert pr
         id: openpr
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const base = '${{ steps.find.outputs.default }}';
-            const head = '${{ steps.meta.outputs.revert_branch }}';
-            const prNumber = Number('${{ steps.find.outputs.prNumber }}');
+            const base = '${{ steps.find.outputs.baseRef }}';
+            const head = '${{ steps.revert.outputs.branch }}';
+            const prNum = Number('${{ steps.find.outputs.prNumber }}');
+            const isMeta = '${{ steps.find.outputs.rcMeta }}' !== '{}' && '${{ steps.find.outputs.rcMeta }}' !== '';
+            const meta = isMeta ? JSON.parse('${{ steps.find.outputs.rcMeta }}') : {};
             const issueNumber = context.payload.issue.number;
 
-            const title = `revert: PR #${prNumber} – ${{ toJson(steps.find.outputs.issueTitle) }}`;
-            const body = [
-              `Reverts merge from PR #${prNumber} (triggered by reopened issue #${issueNumber}).`,
-              '',
-              `Reverts commit: \`${{ steps.find.outputs.mergeSha }}\``,
-              '',
-              `Context: issue #${issueNumber} was reopened.`,
-              '',
-              '---',
-              ${{ toJson(steps.find.outputs.issueBody) }}
-            ].join('\n');
+            const title = `revert: PR #${prNum} – ${{ toJson(steps.find.outputs.issueTitle) }}`;
+            const bodyLines = [
+              `Reverts merge from PR #${prNum} (issue #${issueNumber} reopened).`,
+              `Base: \`${base}\``,
+            ];
+            if (meta.version) bodyLines.push(`Version: \`${meta.version}\``);
+            if (meta.commit)  bodyLines.push(`Release commit: \`${meta.commit}\``);
+            bodyLines.push('', '---', ${{ toJson(steps.find.outputs.issueBody) }});
+            const body = bodyLines.join('\n');
 
             const { data: pr } = await github.rest.pulls.create({ ...repo, title, head, base, body, draft: false });
 
-            // Copy labels already on the issue (avoid inventing new labels that might not exist)
             const labels = JSON.parse('${{ steps.find.outputs.labels }}');
             if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
-
-            // Copy milestone if any
             const milestone = '${{ steps.find.outputs.milestone }}';
             if (milestone) await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
-
-            // Assignees: if issue has any, use them; else assign the issue creator
             const assignees = JSON.parse('${{ steps.find.outputs.assignees }}');
-            const fallback = ['${{ github.event.issue.user.login }}'];
-            await github.rest.issues.addAssignees({
-              ...repo, issue_number: pr.number, assignees: assignees.length ? assignees : fallback
-            });
+            const finalAssignees = assignees.length ? assignees : ['${{ github.event.issue.user.login }}'];
+            await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: finalAssignees });
 
             core.setOutput('revert_pr_url', pr.html_url);
 
-      - name: Recreate original working branch (if deleted)
+      - name: recreate restore branch at original head
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const defaultRef = 'heads/${{ steps.find.outputs.default }}';
-            const newRef = 'refs/heads/${{ steps.find.outputs.origHeadRef }}';
+            const headSha = '${{ steps.find.outputs.headSha }}';
+            const headRef = '${{ steps.find.outputs.headRef }}';
+            const prNum = '${{ steps.find.outputs.prNumber }}';
 
-            // Get current default branch SHA
-            const { data: def } = await github.rest.git.getRef({ ...repo, ref: defaultRef });
+            if (!headSha) {
+              core.warning('missing headSha; skipping restore branch creation');
+              return;
+            }
+            const slug = (headRef || `pr-${prNum}`).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || `pr-${prNum}`;
+            const newRef = `refs/heads/restore/pr-${prNum}-${slug}`;
 
-            // Try to create the old branch name at default's current tip.
-            // If it already exists (422), that's fine—no-op.
             try {
-              await github.rest.git.createRef({ ...repo, ref: newRef, sha: def.object.sha });
+              await github.rest.git.createRef({ ...repo, ref: newRef, sha: headSha });
+              core.info(`created restore branch ${newRef} at ${headSha}`);
             } catch (e) {
               if (e.status === 422) {
-                // Reference already exists; leave it as-is.
+                core.info(`restore branch already exists: ${newRef}`);
               } else {
                 throw e;
               }
             }
-
-      - name: Comment link on the issue 
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              ...context.repo,
-              issue_number: context.payload.issue.number,
-              body: `🔁 Opened revert PR: ${{ steps.openpr.outputs.revert_pr_url }}\nRecreated branch \`${{ steps.find.outputs.origHeadRef }}\` from current \`${{ steps.find.outputs.default }}\`.`
-            })
