@@ -1,68 +1,115 @@
-name: rollback on issue reopen
+name: issue-reopen-get-rc-version
+
 on:
   issues:
     types: [reopened]
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+  contents: read
+  issues: read
 
 jobs:
-  rollback:
-    if: >
-      !contains(toJson(github.event.issue), '"pull_request"') &&
-      (contains(join(github.event.issue.labels.*.name, ','), 'release') ||
-       contains(join(github.event.issue.labels.*.name, ','), 'hotfix'))
+  rc-version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-meta.outputs.version }}
+      rc_tag: ${{ steps.find-pr.outputs.rc_tag }}
+      pr_number: ${{ steps.find-pr.outputs.pr_number }}
+
+    env:
+      RC_META_PATH: rc-meta.json            # change if needed
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # gh uses this automatically
 
     steps:
-      - name: resolve merged PR (and rc-meta)
-        id: find
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const repo = context.repo;
-            const issueNum = context.payload.issue.number;
-            // merged PR that closed this issue
-            const q = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${issueNum}"`;
-            const s = await github.rest.search.issuesAndPullRequests({ q, per_page: 1, sort: 'updated', order: 'desc' });
-            if (!s.data.items.length) core.setFailed(`no merged PR found for issue #${issueNum}`);
-            const prNum = s.data.items[0].number;
-            const pr = (await github.rest.pulls.get({ ...repo, pull_number: prNum })).data;
-            if (!pr.merged) core.setFailed(`PR #${prNum} not merged`);
-            // Optional: read rc-meta.json from tag rc-pr-<PR#> (non-deprecated endpoints)
-            try {
-              const rel = await github.rest.repos.getReleaseByTag({ ...repo, tag: `rc-pr-${pr.number}` });
-              const asset = (rel.data.assets || []).find(a => a.name === 'rc-meta.json');
-              if (asset) {
-                const bin = await github.request('GET /repos/{owner}/{repo}/releases/assets/{asset_id}', {
-                  owner: repo.owner, repo: repo.repo, asset_id: asset.id,
-                  headers: { accept: 'application/octet-stream' }
-                });
-                const meta = JSON.parse(Buffer.from(bin.data).toString('utf8'));
-                core.info(`rc-meta: version=${meta.version || ''} commit=${meta.commit || ''}`);
-              }
-            } catch {}
-            // outputs
-            core.setOutput('pr_node_id', pr.node_id);
-            core.setOutput('pr_number', String(pr.number));
-            core.setOutput('base_ref', pr.base.ref);
-            core.setOutput('head_ref', pr.head.ref || '');
-            core.setOutput('head_sha', pr.head.sha || '');
-            core.setOutput('title', pr.title || '');
-      - name: open revert PR
-        id: revert
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const prId = '${{ steps.find.outputs.pr_node_id }}';
-            const m = `mutation($input: RevertPullRequestInput!){
-              revertPullRequest(input:$input){ pullRequest{ number url headRefName baseRefName } }
-            }`;
-            const r = await github.graphql(m, { input: { pullRequestId: prId }});
-            const rp = r?.revertPullRequest?.pullRequest;
-            if (!rp) core.setFailed('revertPullRequest failed');
-            core.info(`revert PR: #${rp.number} ${rp.url} head=${rp.headRefName} base=${rp.baseRefName}`);
-            core.setOutput('number', String(rp.number));
+      - name: Find merged PR that closed this issue → rc tag
+        id: find-pr
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+
+          read -r -d '' QUERY <<'GRAPHQL'
+          query($owner:String!, $repo:String!, $issue:Int!) {
+            repository(owner:$owner, name:$repo) {
+              issue(number:$issue) {
+                timelineItems(itemTypes: CROSS_REFERENCED_EVENT, first: 100) {
+                  nodes {
+                    ... on CrossReferencedEvent {
+                      willCloseTarget
+                      source {
+                        __typename
+                        ... on PullRequest { number merged mergedAt }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          GRAPHQL
+
+          response=$(gh api graphql -f owner="$OWNER" -f repo="$REPO" -F issue="$ISSUE_NUMBER" -f query="$QUERY")
+
+          PR_NUMBER=$(jq -r '
+            .data.repository.issue.timelineItems.nodes
+            | map(select(.willCloseTarget == true and .source.__typename == "PullRequest" and .source.merged == true))
+            | sort_by(.source.mergedAt) | last | .source.number // empty
+          ' <<<"$response")
+
+          if [[ -z "${PR_NUMBER:-}" || "$PR_NUMBER" == "null" ]]; then
+            echo "No merged PR found that closed issue #$ISSUE_NUMBER" >&2
+            exit 1
+          fi
+
+          RC_TAG="rc-pr-${PR_NUMBER}"
+
+          echo "owner=$OWNER"           >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO"             >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER"   >> "$GITHUB_OUTPUT"
+          echo "rc_tag=$RC_TAG"         >> "$GITHUB_OUTPUT"
+
+      - name: Download rc-meta.json (release asset or tag) and extract version
+        id: get-meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OWNER="${{ steps.find-pr.outputs.owner }}"
+          REPO="${{ steps.find-pr.outputs.repo }}"
+          RC_TAG="${{ steps.find-pr.outputs.rc_tag }}"
+          RC_META_PATH="${RC_META_PATH}"
+
+          mkdir -p meta
+          TARGET_FILE="meta/$(basename "$RC_META_PATH")"
+
+          # Try release asset first
+          if gh release view "$RC_TAG" >/dev/null 2>&1; then
+            echo "Found release $RC_TAG. Trying asset $(basename "$RC_META_PATH")..."
+            if gh release download "$RC_TAG" -p "$(basename "$RC_META_PATH")" -D meta >/dev/null 2>&1; then
+              echo "Downloaded release asset to $TARGET_FILE"
+            else
+              echo "Asset not found in release; fetching from repo at ref $RC_TAG..."
+              gh api "repos/$OWNER/$REPO/contents/$RC_META_PATH?ref=$RC_TAG" --jq '.content' | base64 -d > "$TARGET_FILE"
+            fi
+          else
+            echo "Release $RC_TAG not found; fetching from repo at ref $RC_TAG..."
+            gh api "repos/$OWNER/$REPO/contents/$RC_META_PATH?ref=$RC_TAG" --jq '.content' | base64 -d > "$TARGET_FILE"
+          fi
+
+          if [[ ! -s "$TARGET_FILE" ]]; then
+            echo "rc-meta.json not found at $RC_META_PATH in tag/release $RC_TAG" >&2
+            exit 1
+          fi
+
+          VERSION=$(jq -r '.version // .Version // .VERSION // empty' "$TARGET_FILE")
+          if [[ -z "${VERSION:-}" || "$VERSION" == "null" ]]; then
+            echo "No 'version' key found in $TARGET_FILE" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "RC Tag: $RC_TAG"
+          echo "Version: $VERSION"
