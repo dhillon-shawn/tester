@@ -2,7 +2,7 @@ name: Pipeline Caller
 
 on:
   push:
-    branches: [ "feature/**" ]
+    branches: [ "release/**" ]
     paths-ignore:
       - '.github/**'
   pull_request:
