@@ -1,5 +1,4 @@
 name: rollback on issue reopen
-
 on:
   issues:
     types: [reopened]
@@ -18,28 +17,27 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: resolve merged PR + rc-meta (logs)
+      - name: resolve merged PR + rc-meta
         id: find
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const issueNumber = context.payload.issue.number;
+            const n = context.payload.issue.number;
 
-            // Find merged PR that closed this issue
-            const q = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${issueNumber}"`;
-            const search = await github.rest.search.issuesAndPullRequests({ q, per_page: 1, sort: 'updated', order: 'desc' });
-            if (!search.data.items.length) core.setFailed(`no merged PR found for issue #${issueNumber}`);
-            const prNumber = search.data.items[0].number;
+            // merged PR that closed this issue
+            const q = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${n}"`;
+            const s = await github.rest.search.issuesAndPullRequests({ q, per_page: 1, sort: 'updated', order: 'desc' });
+            if (!s.data.items.length) core.setFailed(`no merged PR found for #${n}`);
+            const prNum = s.data.items[0].number;
 
-            // PR details
-            const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: prNumber });
-            if (!pr.merged) core.setFailed(`PR #${prNumber} is not merged`);
+            const pr = (await github.rest.pulls.get({ ...repo, pull_number: prNum })).data;
+            if (!pr.merged) core.setFailed(`PR #${prNum} not merged`);
 
-            core.info(`issue=#${issueNumber} -> pr=#${pr.number} base=${pr.base.ref} merge_sha=${pr.merge_commit_sha || '(none)'} head_sha=${pr.head.sha} head_ref=${pr.head.ref}`);
+            core.info(`issue=#${n} -> pr=#${pr.number} base=${pr.base.ref} merge_sha=${pr.merge_commit_sha || '(none)'} head_sha=${pr.head.sha} head_ref=${pr.head.ref}`);
 
-            // Try to read rc-meta.json from release tag rc-pr-<PR#>
-            let rcMeta = {};
+            // rc-meta.json on tag rc-pr-<PR#>
+            let meta = {};
             try {
               const rel = await github.request('GET /repos/{owner}/{repo}/releases/tags/{tag}', {
                 owner: repo.owner, repo: repo.repo, tag: `rc-pr-${pr.number}`
@@ -47,30 +45,26 @@ jobs:
               const asset = (rel.data.assets || []).find(a => a.name === 'rc-meta.json');
               if (asset) {
                 const bin = await github.request('GET ' + asset.url, { headers: { Accept: 'application/octet-stream' } });
-                rcMeta = JSON.parse(Buffer.from(bin.data).toString('utf8'));
-                core.info(`rc-meta: version=${rcMeta.version || ''} commit=${rcMeta.commit || ''} package=${rcMeta.package || ''}`);
+                meta = JSON.parse(Buffer.from(bin.data).toString('utf8'));
+                core.info(`rc-meta: version=${meta.version || ''} commit=${meta.commit || ''}`);
               } else {
-                core.info(`rc-meta: rc-meta.json not found on tag rc-pr-${pr.number}`);
+                core.info('rc-meta: asset not found');
               }
-            } catch (e) {
-              core.info(`rc-meta: no tag rc-pr-${pr.number} (${e.status || 'n/a'})`);
-            }
+            } catch { core.info('rc-meta: tag not found'); }
 
-            // Pass along data for later steps
-            const { data: issue } = await github.rest.issues.get({ ...repo, issue_number: issueNumber });
-            core.setOutput('pr_number', String(pr.number));
             core.setOutput('pr_node_id', pr.node_id);
-            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('pr_number', String(pr.number));
             core.setOutput('head_sha', pr.head.sha || '');
             core.setOutput('head_ref', pr.head.ref || '');
-            core.setOutput('issue_title', issue.title || pr.title || '');
-            core.setOutput('issue_body', issue.body || '');
-            core.setOutput('labels', JSON.stringify((issue.labels||[]).map(l => typeof l === 'string' ? l : l.name)));
-            core.setOutput('assignees', JSON.stringify((issue.assignees||[]).map(a => a.login)));
-            core.setOutput('milestone', issue.milestone ? String(issue.milestone.number) : '');
-            core.setOutput('rc_meta', JSON.stringify(rcMeta));
+            core.setOutput('title', pr.title || '');
+            core.setOutput('issue_title', context.payload.issue.title || '');
+            core.setOutput('issue_body', context.payload.issue.body || '');
+            core.setOutput('labels', JSON.stringify((context.payload.issue.labels||[]).map(l => typeof l === 'string' ? l : l.name)));
+            core.setOutput('assignees', JSON.stringify((context.payload.issue.assignees||[]).map(a => a.login)));
+            core.setOutput('milestone', context.payload.issue.milestone ? String(context.payload.issue.milestone.number) : '');
+            core.setOutput('rc_meta', JSON.stringify(meta));
 
-      - name: open revert PR via GraphQL (logs)
+      - name: revert PR (GraphQL)
         id: revert
         uses: actions/github-script@v7
         with:
@@ -82,42 +76,39 @@ jobs:
                   pullRequest { number url }
                 }
               }`;
-            const vars = { input: { pullRequestId: prId } };
-            const resp = await github.graphql(mutation, vars);
-            const rpr = resp?.revertPullRequest?.pullRequest;
-            if (!rpr) core.setFailed('revertPullRequest returned no PR');
-            core.info(`revert PR opened: #${rpr.number} ${rpr.url}`);
-            core.setOutput('revert_number', String(rpr.number));
-            core.setOutput('revert_url', rpr.url);
+            const out = await github.graphql(mutation, { input: { pullRequestId: prId }});
+            const r = out?.revertPullRequest?.pullRequest;
+            if (!r) core.setFailed('revertPullRequest failed');
+            core.info(`revert PR: #${r.number} ${r.url}`);
+            core.setOutput('number', String(r.number));
+            core.setOutput('url', r.url);
 
-      - name: copy labels/milestone/assignees to revert PR
+      - name: annotate revert PR (labels/milestone/assignees)
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const prNum = Number('${{ steps.revert.outputs.revert_number }}');
+            const num = Number('${{ steps.revert.outputs.number }}');
             const labels = JSON.parse('${{ steps.find.outputs.labels }}');
-            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: prNum, labels });
-            const milestone = '${{ steps.find.outputs.milestone }}';
-            if (milestone) await github.rest.issues.update({ ...repo, issue_number: prNum, milestone: Number(milestone) });
-            const assignees = JSON.parse('${{ steps.find.outputs.assignees }}');
-            const fall = ['${{ github.event.issue.user.login }}'];
-            await github.rest.issues.addAssignees({ ...repo, issue_number: prNum, assignees: assignees.length ? assignees : fall });
+            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: num, labels });
+            const ms = '${{ steps.find.outputs.milestone }}';
+            if (ms) await github.rest.issues.update({ ...repo, issue_number: num, milestone: Number(ms) });
+            const asg = JSON.parse('${{ steps.find.outputs.assignees }}');
+            await github.rest.issues.addAssignees({ ...repo, issue_number: num, assignees: asg.length ? asg : ['${{ github.event.issue.user.login }}'] });
 
-      - name: create restore branch at PR head (logs)
+      - name: create restore branch (best-effort)
         uses: actions/github-script@v7
         with:
           script: |
-            const repo = context.repo;
-            const headSha = '${{ steps.find.outputs.head_sha }}';
-            const headRef = '${{ steps.find.outputs.head_ref }}';
-            const prNum   = '${{ steps.find.outputs.pr_number }}';
-            if (!headSha) { core.info('restore: no head sha; skip'); return; }
-            const slug = (headRef || `pr-${prNum}`).toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || `pr-${prNum}`;
-            const ref = `refs/heads/restore/pr-${prNum}-${slug}`;
             try {
-              await github.rest.git.createRef({ ...repo, ref, sha: headSha });
-              core.info(`restore: created ${ref} at ${headSha}`);
+              const repo = context.repo;
+              const sha = '${{ steps.find.outputs.head_sha }}';
+              if (!sha) { core.info('restore: no head sha'); return; }
+              const refName = ( '${{ steps.find.outputs.head_ref }}' || `pr-${'${{ steps.find.outputs.pr_number }}'}` )
+                .toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || `pr-${'${{ steps.find.outputs.pr_number }}'}`;
+              const ref = `refs/heads/restore/pr-${'${{ steps.find.outputs.pr_number }}'}-${refName}`;
+              await github.rest.git.createRef({ ...repo, ref, sha });
+              core.info(`restore: ${ref} @ ${sha}`);
             } catch (e) {
-              if (e.status === 422) core.info(`restore: exists ${ref}`); else throw e;
+              core.info(`restore: skipped (${e.status || ''} ${e.message})`);
             }
