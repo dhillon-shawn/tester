@@ -5,7 +5,10 @@ on:
     types: [reopened]
 
 permissions:
-  write-all
+  contents: write
+  pull-requests: write
+  issues: write
+  workflows: write  
 
 jobs:
   hotfix_from_pr_head:
@@ -91,7 +94,7 @@ jobs:
           git switch --detach origin/pr-${pr_number}-head
           git switch -c "$branch"
 
-          # empty commit so pr always opens cleanly
+          # empty commit so pr always opens cleanly (and to avoid "no diff" edge cases)
           git commit --allow-empty -m "chore: initialize hotfix from pr #${pr_number} [skip ci]"
           git push --set-upstream origin "$branch"
 
@@ -114,9 +117,9 @@ jobs:
             const rc_commit  = '${{ steps.find.outputs.rc_commit }}';
             if (rc_version) lines.push(`version: \`${rc_version}\``);
             if (rc_commit)  lines.push(`release commit: \`${rc_commit}\``);
-            const front_matter = lines.length ? lines.join('\n') + '\n\n' : '';
+            const front = lines.length ? lines.join('\n') + '\n\n' : '';
 
-            const body = front_matter + [
+            const body = front + [
               `hotfix continuation created from github's persistent ref \`refs/pull/${pr_number}/head\`.`,
               '',
               '---',
