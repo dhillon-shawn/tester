@@ -1,4 +1,5 @@
 name: issue-reopen-get-rc-version
+
 on:
   issues:
     types: [reopened]
@@ -10,87 +11,184 @@ permissions:
 jobs:
   rc-version:
     runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.get-meta.outputs.version }}
-      rc_tag:   ${{ steps.get-meta.outputs.rc_tag }}
-      pr:       ${{ steps.get-meta.outputs.pr }}
-
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # path to your rc-meta
       RC_META_PATH: rc-meta.json
+      # turn on verbose gh logging (useful for debugging)
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_DEBUG: api
 
     steps:
-      - name: Resolve PR that closed this issue (GraphQL first, REST fallback)
-        id: who-closed
+      - name: Resolve PR that actually closed this issue (robust w/ logging)
+        id: resolve-pr
         shell: bash
         run: |
           set -euo pipefail
-          owner="${GITHUB_REPOSITORY%/*}"
-          repo="${GITHUB_REPOSITORY#*/}"
-          issue="${{ github.event.issue.number }}"
 
-          # --- Try GraphQL: issue.closedByPullRequestsReferences (noise-free) ---
-          read -r -d '' Q <<'GQL'
-          query($owner:String!, $repo:String!, $n:Int!) {
-            repository(owner:$owner, name:$repo) {
-              issue(number:$n) {
-                closedByPullRequestsReferences(last: 1) {
-                  nodes { number merged mergedAt }
-                }
-              }
-            }
+          # ---------- helpers ----------
+          log(){ echo "::notice::[$(date +%H:%M:%S)] $*"; }
+          warn(){ echo "::warning::[$(date +%H:%M:%S)] $*" >&2; }
+          die(){ echo "::error::[$(date +%H:%M:%S)] $*"; exit 1; }
+          j(){ jq -e "$@" || { warn "jq parse failed for filter: $*"; return 1; }; }
+
+          # simple retry wrapper for gh api
+          gh_api(){
+            local attempt=1 max=4 delay=1
+            while true; do
+              if out=$(gh api "$@" 2>gh.err); then
+                printf '%s' "$out"
+                return 0
+              fi
+              warn "gh api failed (attempt $attempt): $(tr -d '\r' < gh.err | tail -n 2)"
+              if (( attempt >= max )); then
+                return 1
+              fi
+              sleep "$delay"; attempt=$((attempt+1)); delay=$((delay*2))
+            done
           }
-          GQL
-          pr=$(gh api graphql -f owner="$owner" -f repo="$repo" -F n="$issue" -f query="$Q" \
-               --jq '.data.repository.issue.closedByPullRequestsReferences.nodes[0].number' 2>/dev/null || echo "")
 
-          if [[ -z "${pr}" || "${pr}" == "null" ]]; then
-            # --- Fallback: REST -> issue events -> closed.commit_id -> commit→pulls ---
-            close_commit=$(gh api "repos/$owner/$repo/issues/$issue/events" --paginate \
-              --jq '[.[] | select(.event=="closed" and .commit_id!=null)] | last | .commit_id' \
-              2>/dev/null || echo "")
-            if [[ -z "${close_commit}" || "${close_commit}" == "null" ]]; then
-              echo "Could not find closing commit for issue #$issue" >&2
-              exit 1
+          # ---------- context ----------
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          echo "owner=$OWNER"          >> "$GITHUB_OUTPUT"
+          echo "repo=$REPO"            >> "$GITHUB_OUTPUT"
+          echo "issue=$ISSUE_NUMBER"   >> "$GITHUB_OUTPUT"
+          log "Owner: $OWNER  Repo: $REPO  Issue: #$ISSUE_NUMBER"
+
+          # ---------- sanity checks ----------
+          gh auth status || die "gh not authenticated. Ensure GITHUB_TOKEN is set in this job."
+          type -p jq >/dev/null || die "jq not found"
+
+          # ---------- Strategy A: PRs that explicitly close this issue (search) ----------
+          # We search closed PRs whose body/title contains closes/fixes/resolves #ISSUE
+          # Then we keep only merged PRs and pick latest by merged_at.
+          log "Searching for PRs that explicitly close #$ISSUE_NUMBER …"
+          Q="repo:$OWNER/$REPO is:pr is:closed (in:title in:body) (closes #$ISSUE_NUMBER OR fixes #$ISSUE_NUMBER OR resolves #$ISSUE_NUMBER)"
+          SEARCH_JSON="$(gh_api "search/issues" -f q="$Q" -f per_page=100 || true)"
+          pr_a=""
+          if [[ -n "$SEARCH_JSON" ]]; then
+            # Extract candidate PR numbers
+            mapfile -t pr_candidates < <(printf '%s' "$SEARCH_JSON" | j '.items[].number' -r || true)
+            log "Search returned ${#pr_candidates[@]} candidate(s): ${pr_candidates[*]:-none}"
+
+            best_pr=""; best_merged_at=""
+            for n in "${pr_candidates[@]:-}"; do
+              pr_json="$(gh_api "repos/$OWNER/$REPO/pulls/$n" || true)"
+              [[ -n "$pr_json" ]] || continue
+              merged=$(printf '%s' "$pr_json" | j '.merged' -r || echo "false")
+              merged_at=$(printf '%s' "$pr_json" | j '.merged_at' -r || echo "")
+              if [[ "$merged" == "true" && -n "$merged_at" ]]; then
+                if [[ -z "$best_merged_at" || "$merged_at" > "$best_merged_at" ]]; then
+                  best_pr="$n"; best_merged_at="$merged_at"
+                fi
+              fi
+            done
+            pr_a="$best_pr"
+            if [[ -n "$pr_a" ]]; then
+              log "Strategy A picked PR #$pr_a (merged at $best_merged_at)"
+            else
+              warn "Strategy A found no merged PRs with closing keywords."
             fi
-            # PRs associated with that commit (the merged PR that introduced it to default)
-            pr=$(gh api "repos/$owner/$repo/commits/$close_commit/pulls" \
-                  -H "Accept: application/vnd.github+json" --jq '.[0].number' 2>/dev/null || echo "")
+          else
+            warn "Search API returned no results (or failed)."
           fi
 
-          [[ -n "${pr}" && "${pr}" != "null" ]] || { echo "No PR found for issue #$issue"; exit 1; }
-          echo "pr=$pr" >> "$GITHUB_OUTPUT"
+          # ---------- Strategy B: Issue close event → commit → associated PRs ----------
+          pr_b=""
+          if [[ -z "$pr_a" ]]; then
+            log "Falling back to close-event → commit → PRs…"
+            events_json="$(gh_api "repos/$OWNER/$REPO/issues/$ISSUE_NUMBER/events" --paginate || true)"
+            close_commit="$(printf '%s' "$events_json" | j '[.[] | select(.event=="closed" and .commit_id!=null)] | last | .commit_id' -r || echo "")"
+            if [[ -n "$close_commit" && "$close_commit" != "null" ]]; then
+              log "Close event commit: $close_commit"
+              pulls_json="$(gh_api "repos/$OWNER/$REPO/commits/$close_commit/pulls" -H "Accept: application/vnd.github+json" || true)"
+              mapfile -t pulls < <(printf '%s' "$pulls_json" | j '.[].number' -r || true)
+              log "Commit is associated with PR(s): ${pulls[*]:-none}"
 
-      - name: Download rc-meta.json from rc-pr-<PR> and extract version
+              best_pr=""; best_merged_at=""
+              for n in "${pulls[@]:-}"; do
+                pr_json="$(gh_api "repos/$OWNER/$REPO/pulls/$n" || true)"
+                [[ -n "$pr_json" ]] || continue
+                merged=$(printf '%s' "$pr_json" | j '.merged' -r || echo "false")
+                merged_at=$(printf '%s' "$pr_json" | j '.merged_at' -r || echo "")
+                if [[ "$merged" == "true" && -n "$merged_at" ]]; then
+                  if [[ -z "$best_merged_at" || "$merged_at" > "$best_merged_at" ]]; then
+                    best_pr="$n"; best_merged_at="$merged_at"
+                  fi
+                fi
+              done
+              pr_b="$best_pr"
+              [[ -n "$pr_b" ]] && log "Strategy B picked PR #$pr_b (merged at $best_merged_at)" || warn "Strategy B found no merged PRs."
+            else
+              warn "No closing commit_id found in issue events."
+            fi
+          fi
+
+          PR_NUMBER="${pr_a:-$pr_b}"
+          [[ -n "$PR_NUMBER" ]] || die "No merged PR found that closed issue #$ISSUE_NUMBER (after both strategies)."
+
+          RC_TAG="rc-pr-${PR_NUMBER}"
+          echo "pr=$PR_NUMBER"     >> "$GITHUB_OUTPUT"
+          echo "rc_tag=$RC_TAG"    >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### PR Resolution"
+            echo "- Issue: #$ISSUE_NUMBER"
+            echo "- PR: #$PR_NUMBER"
+            echo "- RC Tag: \`$RC_TAG\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download rc-meta.json and extract version (with logs + fallbacks)
         id: get-meta
         shell: bash
         run: |
           set -euo pipefail
-          owner="${GITHUB_REPOSITORY%/*}"
-          repo="${GITHUB_REPOSITORY#*/}"
-          pr="${{ steps.who-closed.outputs.pr }}"
-          rc_tag="rc-pr-${pr}"
-          meta_path="$RC_META_PATH"
-          target="meta/$(basename "$meta_path")"
-          mkdir -p meta
 
-          if gh release view "$rc_tag" >/dev/null 2>&1; then
-            gh release download "$rc_tag" -p "$(basename "$meta_path")" -D meta >/dev/null 2>&1 \
-              || gh api "repos/$owner/$repo/contents/$meta_path?ref=$rc_tag" --jq '.content' | base64 -d > "$target"
+          log(){ echo "::notice::[$(date +%H:%M:%S)] $*"; }
+          warn(){ echo "::warning::[$(date +%H:%M:%S)] $*" >&2; }
+          die(){ echo "::error::[$(date +%H:%M:%S)] $*"; exit 1; }
+
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          PR_NUMBER="${{ steps.resolve-pr.outputs.pr }}"
+          RC_TAG="${{ steps.resolve-pr.outputs.rc_tag }}"
+          META_PATH="${RC_META_PATH}"
+          TARGET_DIR="meta"
+          TARGET_FILE="$TARGET_DIR/$(basename "$META_PATH")"
+
+          mkdir -p "$TARGET_DIR"
+
+          log "Trying release asset first: $RC_TAG / $(basename "$META_PATH")"
+          if gh release view "$RC_TAG" >/dev/null 2>&1; then
+            if gh release download "$RC_TAG" -p "$(basename "$META_PATH")" -D "$TARGET_DIR" >/dev/null 2>&1; then
+              log "Downloaded release asset to $TARGET_FILE"
+            else
+              warn "Asset not found in release; fetching file from repo at ref $RC_TAG"
+              gh api "repos/$OWNER/$REPO/contents/$META_PATH?ref=$RC_TAG" --jq '.content' | base64 -d > "$TARGET_FILE" || die "Failed to fetch $META_PATH from ref $RC_TAG"
+            fi
           else
-            gh api "repos/$owner/$repo/contents/$meta_path?ref=$rc_tag" --jq '.content' | base64 -d > "$target"
+            warn "Release $RC_TAG not found; fetching file from repo at ref $RC_TAG"
+            gh api "repos/$OWNER/$REPO/contents/$META_PATH?ref=$RC_TAG" --jq '.content' | base64 -d > "$TARGET_FILE" || die "Failed to fetch $META_PATH from ref $RC_TAG"
           fi
 
-          [[ -s "$target" ]] || { echo "rc-meta.json not found at $meta_path in $rc_tag"; exit 1; }
-          version=$(jq -r '.version // .Version // .VERSION // empty' "$target")
-          [[ -n "$version" && "$version" != "null" ]] || { echo "No version key in $target"; exit 1; }
+          [[ -s "$TARGET_FILE" ]] || die "rc-meta not found or empty at $META_PATH for ref/release $RC_TAG"
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "rc_tag=$rc_tag"   >> "$GITHUB_OUTPUT"
-          echo "pr=$pr"           >> "$GITHUB_OUTPUT"
+          # Parse version
+          VERSION=$(jq -r '.version // .Version // .VERSION // empty' "$TARGET_FILE")
+          [[ -n "$VERSION" && "$VERSION" != "null" ]] || die "No 'version' key in $TARGET_FILE"
 
-      - name: Summary
-        run: |
-          echo "PR:       ${{ steps.get-meta.outputs.pr }}"
-          echo "RC Tag:   ${{ steps.get-meta.outputs.rc_tag }}"
-          echo "Version:  ${{ steps.get-meta.outputs.version }}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "rc_tag=$RC_TAG"   >> "$GITHUB_OUTPUT"
+          echo "pr=$PR_NUMBER"    >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### rc-meta.json"
+            echo "- PR: #$PR_NUMBER"
+            echo "- RC Tag: \`$RC_TAG\`"
+            echo "- Version: \`$VERSION\`"
+            echo ""
+            echo "<details><summary>rc-meta snippet</summary>"
+            head -n 100 "$TARGET_FILE" | sed 's/</\&lt;/g;s/>/\&gt;/g'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
