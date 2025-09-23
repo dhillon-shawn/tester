@@ -5,7 +5,9 @@ on:
     types: [reopened]
 
 permissions:
-    write-all
+  contents: write
+  pull-requests: write
+  issues: write
 
 jobs:
   restore_and_pr:
@@ -21,6 +23,7 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.issue.number;
 
+            // find the merged PR that closed this issue
             const query = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${issue_number}"`;
             const search = await github.rest.search.issuesAndPullRequests({
               q: query, per_page: 1, sort: 'updated', order: 'desc'
@@ -34,48 +37,50 @@ jobs:
             const issue = context.payload.issue;
             const issue_title = issue.title || pr.title || '';
             const issue_body  = issue.body  || '';
-            const labels      = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
-            const assignees   = (issue.assignees || []).map(a => a.login);
-            const milestone   = issue.milestone ? String(issue.milestone.number) : '';
+            const labels_json = JSON.stringify((issue.labels || []).map(l => typeof l === 'string' ? l : l.name));
+            const assignees_json = JSON.stringify((issue.assignees || []).map(a => a.login));
+            const milestone = issue.milestone ? String(issue.milestone.number) : '';
 
             core.info(`restore target: pr=${pr.number} base=${pr.base.ref} head_ref=${pr.head.ref} head_sha=${pr.head.sha}`);
 
             core.setOutput('pr_number', String(pr.number));
             core.setOutput('base_ref', pr.base.ref);
             core.setOutput('head_ref', pr.head.ref || '');
-            core.setOutput('head_sha', pr.head.sha || '');
             core.setOutput('issue_title', issue_title);
             core.setOutput('issue_body', issue_body);
-            core.setOutput('labels_json', JSON.stringify(labels));
-            core.setOutput('assignees_json', JSON.stringify(assignees));
+            core.setOutput('labels_json', labels_json);
+            core.setOutput('assignees_json', assignees_json);
             core.setOutput('milestone', milestone);
 
-      - name: restore_branch_exact_name
+      - name: restore_branch (UI-equivalent)
         id: restore
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const head_ref = '${{ steps.find.outputs.head_ref }}';
-            const head_sha = '${{ steps.find.outputs.head_sha }}';
-            if (!head_ref || !head_sha) core.setFailed('missing head_ref or head_sha');
+            const pr_number = Number('${{ steps.find.outputs.pr_number }}');
 
             try {
-              // exact equivalent of “Restore branch”: recreate the ref at the PR head sha
-              await github.rest.git.createRef({ ...repo, ref: `refs/heads/${head_ref}`, sha: head_sha });
-              core.info(`restored branch: ${head_ref} @ ${head_sha}`);
+              const restored = await github.rest.pulls.restore({ ...repo, pull_number: pr_number });
+              // When successful, restored.data.head.ref is the branch name
+              const head_ref = restored.data.head?.ref || '';
+              core.info(`restored branch via API: ${head_ref}`);
+              core.setOutput('restored_head', head_ref);
             } catch (e) {
               if (e.status === 422) {
-                // already exists — that’s fine, just proceed
-                core.info(`branch already exists: ${head_ref}`);
+                // 422 means "already restored" or not restorable; fall back to PR.head.ref we discovered
+                const head_ref = '${{ steps.find.outputs.head_ref }}';
+                core.info(`restore not needed or not applicable (422). using existing head: ${head_ref}`);
+                core.setOutput('restored_head', head_ref);
+              } else if (e.status === 403) {
+                // org policy still blocks; surface a clear message
+                core.setFailed(`restore forbidden (403). ask an admin to allow Actions to use "Restore pull request branch" or run manually in the UI.`);
               } else {
                 throw e;
               }
             }
-            core.setOutput('restored_head', head_ref);
 
       - name: open_pr_from_restored_branch
-        id: open
         uses: actions/github-script@v7
         with:
           script: |
@@ -84,27 +89,28 @@ jobs:
             const head_ref = '${{ steps.restore.outputs.restored_head }}';
             const pr_number = Number('${{ steps.find.outputs.pr_number }}');
 
+            if (!head_ref) core.setFailed('missing restored head branch name');
+
             const title = `follow-up for pr #${pr_number}`;
             const body  = [
-              `restored branch \`${head_ref}\` (matches the UI "Restore branch").`,
+              `restored branch \`${head_ref}\` (same as clicking "Restore branch" in the UI).`,
               '',
               '---',
               ${{ toJson(steps.find.outputs.issue_body) }}
             ].join('\n');
 
-            const pr = (await github.rest.pulls.create({
+            const new_pr = (await github.rest.pulls.create({
               ...repo, title, head: head_ref, base: base_ref, body, draft: false
             })).data;
 
-            // mirror issue metadata
             const labels = JSON.parse('${{ steps.find.outputs.labels_json }}');
-            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
+            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: new_pr.number, labels });
 
             const milestone = '${{ steps.find.outputs.milestone }}';
-            if (milestone) await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
+            if (milestone) await github.rest.issues.update({ ...repo, issue_number: new_pr.number, milestone: Number(milestone) });
 
             const assignees = JSON.parse('${{ steps.find.outputs.assignees_json }}');
             const final_assignees = assignees.length ? assignees : ['${{ github.event.issue.user.login }}'];
-            await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: final_assignees });
+            await github.rest.issues.addAssignees({ ...repo, issue_number: new_pr.number, assignees: final_assignees });
 
-            core.info(`opened pr: #${pr.number} ${pr.html_url}`)
+            core.info(`opened pr: #${new_pr.number} ${new_pr.html_url}`)
