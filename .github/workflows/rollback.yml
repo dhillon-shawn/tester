@@ -33,4 +33,4 @@ jobs:
             core.setOutput('pr_number', pr); return pr;
 
       - name: Use it
-        run: echo "PR number #${{ steps.find.outputs.result }}"
+        run: echo "PR number ${{ steps.find.outputs.result }}"
