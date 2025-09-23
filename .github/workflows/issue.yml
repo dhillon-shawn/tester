@@ -1,101 +1,146 @@
-name: issue-reopen-get-rc-version
+name: Create branch and PR for issues
+
 on:
   issues:
-    types: [reopened]
+    types: [opened]
 
 permissions:
-  contents: read
-  issues: read
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: issues
+  cancel-in-progress: true
 
 jobs:
-  rc-version:
+  issue_to_pr:
+    if: >
+      contains(join(github.event.issue.labels.*.name, ','), 'release') ||
+      contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      RC_META_PATH: rc-meta.json   # change if your file lives elsewhere
 
     steps:
-      - name: Get PR that closed this issue (from timeline "closed in #<PR>")
-        id: pr
-        shell: bash
+      - name: assign check
+        id: check
         run: |
-          set -euo pipefail
-          set -x
-
-          owner="${GITHUB_REPOSITORY%/*}"
-          repo="${GITHUB_REPOSITORY#*/}"
-          issue="${{ github.event.issue.number }}"
-
-          # Look for the final "closed" timeline event that carries a PR in `source.issue`
-          pr_number=$(
-            gh api "repos/$owner/$repo/issues/$issue/timeline" \
-              --paginate \
-              -H "Accept: application/vnd.github+json" \
-              --jq '
-                [ .[]
-                  | select(
-                      .event == "closed"
-                      and .source != null
-                      and .source.type == "issue"
-                      and (.source.issue.pull_request|type) == "object"
-                    )
-                ]
-                | last
-                | .source.issue.number // empty
-              '
-          )
-
-          if [[ -z "${pr_number:-}" ]]; then
-            echo "No closing PR found in issue timeline for #$issue" >&2
-            exit 1
-          fi
-
-          # (Optional) ensure that PR is merged
-          merged=$(gh api "repos/$owner/$repo/pulls/$pr_number" --jq '.merged')
-          if [[ "$merged" != "true" ]]; then
-            echo "PR #$pr_number is not merged (merged=$merged)" >&2
-            exit 1
-          fi
-
-          rc_tag="rc-pr-${pr_number}"
-
-          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
-          echo "rc_tag=$rc_tag"       >> "$GITHUB_OUTPUT"
-
-          echo "Resolved closing PR: #$pr_number"
-          echo "Derived tag: $rc_tag"
-
-      - name: Download rc-meta.json and extract version
-        id: meta
-        shell: bash
-        run: |
-          set -euo pipefail
-          set -x
-
-          owner="${GITHUB_REPOSITORY%/*}"
-          repo="${GITHUB_REPOSITORY#*/}"
-          rc_tag="${{ steps.pr.outputs.rc_tag }}"
-          meta_path="${RC_META_PATH}"
-          out="meta/$(basename "$meta_path")"
-          mkdir -p meta
-
-          # Try release asset first; if not there, fetch the file at ref=rc_tag
-          if gh release view "$rc_tag" >/dev/null 2>&1; then
-            gh release download "$rc_tag" -p "$(basename "$meta_path")" -D meta >/dev/null 2>&1 \
-              || gh api "repos/$owner/$repo/contents/$meta_path?ref=$rc_tag" --jq '.content' | base64 -d > "$out"
+          echo "issue_number=${{ github.event.issue.number }}"
+          echo "assignees_json=${{ toJson(github.event.issue.assignees) }}"
+          if [ "${{ toJson(github.event.issue.assignees) }}" = "[]" ]; then
+            echo "has_assignees=false" >> $GITHUB_OUTPUT
+            echo "result=no current assignee"
           else
-            gh api "repos/$owner/$repo/contents/$meta_path?ref=$rc_tag" --jq '.content' | base64 -d > "$out"
+            echo "has_assignees=true" >> $GITHUB_OUTPUT
+            echo "result=already assigned"
           fi
 
-          [[ -s "$out" ]] || { echo "rc-meta.json not found at $meta_path in $rc_tag"; exit 1; }
+      - name: assign ensure
+        if: steps.check.outputs.has_assignees == 'false'
+        uses: pozil/auto-assign-issue@v2
+        with:
+          assignees: "${{ github.event.issue.user.login }}"
+          numOfAssignee: 1
 
-          version=$(jq -r '.version // .Version // .VERSION // empty' "$out")
-          [[ -n "$version" && "$version" != "null" ]] || { echo "No version key in $out"; exit 1; }
+      - name: issue refresh
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const num = context.payload.issue.number;
+            const { data: issue } = await github.rest.issues.get({ ...repo, issue_number: num });
+            const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
+            const mode = labels.includes('hotfix') ? 'hotfix' : 'release';
+            core.info(`issue: #${num} | mode=${mode} | labels=[${labels.join(', ')}] | assignees=[${(issue.assignees||[]).map(a=>a.login).join(', ')}]`);
+            core.setOutput('title', issue.title || '');
+            core.setOutput('body', issue.body || '');
+            core.setOutput('labels', JSON.stringify(labels));
+            core.setOutput('assignees', JSON.stringify((issue.assignees || []).map(a => a.login)));
+            core.setOutput('milestone', issue.milestone ? String(issue.milestone.number) : '');
+            core.setOutput('mode', mode);
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: meta derive
+        id: meta
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNum = context.payload.issue.number;
+            const nextPrNumber = issueNum + 1;
+            const defaultBranch = context.payload.repository.default_branch;
+            const mode = '${{ steps.issue.outputs.mode }}';
+            const rawTitle = ${{ toJson(steps.issue.outputs.title) }};
+            const title = rawTitle || mode;
+            const slug = title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,50) || mode;
+            const branch = `${mode}/${nextPrNumber}-${slug}`;
+            const isDraft = mode === 'release';
+            const prefix = isDraft ? 'Release: ' : 'Hotfix: ';
+            core.info(`meta: issue=${issueNum} -> planned_pr=${nextPrNumber} | mode=${mode} | draft=${isDraft} | branch=${branch} | default=${defaultBranch}`);
+            core.setOutput('default', defaultBranch);
+            core.setOutput('branch', branch);
+            core.setOutput('plannedPr', String(nextPrNumber));
+            core.setOutput('isDraft', String(isDraft));
+            core.setOutput('prefix', prefix);
+            core.setOutput('slug', slug);
 
-          {
-            echo "PR:       ${{ steps.pr.outputs.pr_number }}"
-            echo "RC Tag:   $rc_tag"
-            echo "Version:  $version"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: checkout default
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.default }}
+
+      - name: branch init
+        env:
+          BRANCH: ${{ steps.meta.outputs.branch }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          MODE: ${{ steps.issue.outputs.mode }}
+        run: |
+          echo "creating branch=$BRANCH from default=${{ steps.meta.outputs.default }} for issue #$ISSUE_NUMBER mode=$MODE"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git commit --allow-empty -m "chore: init $MODE branch for #$ISSUE_NUMBER [skip ci]"
+          git push --set-upstream origin "$BRANCH"
+          echo "pushed branch=$BRANCH"
+
+      - name: pr open
+        id: createpr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const repo = context.repo;
+            const issue_number = context.payload.issue.number;
+            const base = '${{ steps.meta.outputs.default }}';
+            const head = '${{ steps.meta.outputs.branch }}';
+            const isDraft = '${{ steps.meta.outputs.isDraft }}' === 'true';
+            const title = '${{ steps.meta.outputs.prefix }}' + ${{ toJson(steps.issue.outputs.title) }};
+            const body = [
+              `${isDraft ? 'Draft PR' : 'PR'} for issue #${issue_number}`,
+              '',
+              `Closes #${issue_number}`,
+              '',
+              '---',
+              ${{ toJson(steps.issue.outputs.body) }}
+            ].join('\n');
+            const { data: pr } = await github.rest.pulls.create({ ...repo, title, head, base, body, draft: isDraft });
+            const labels = JSON.parse('${{ steps.issue.outputs.labels }}');
+            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
+            const milestone = '${{ steps.issue.outputs.milestone }}';
+            if (milestone) await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
+            const assignees = JSON.parse('${{ steps.issue.outputs.assignees }}');
+            const finalAssignees = assignees.length ? assignees : ['${{ github.event.issue.user.login }}'];
+            await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: finalAssignees });
+            core.info(`pr: actual=${pr.number} | planned=${'${{ steps.meta.outputs.plannedPr }}'} | url=${pr.html_url} | head=${head} -> base=${base} | draft=${isDraft}`);
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('pr_url', pr.html_url)
+
+      - name: pr verify
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const planned = Number('${{ steps.meta.outputs.plannedPr }}');
+            const actual  = Number('${{ steps.createpr.outputs.pr_number }}');
+            if (planned !== actual) {
+              core.warning(`verify: planned_pr=${planned} != actual_pr=${actual} (branch remains '${{ steps.meta.outputs.branch }}')`);
+            } else {
+              core.info(`verify: planned_pr matches actual_pr=${actual}`);
+            }
