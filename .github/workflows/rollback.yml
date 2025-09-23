@@ -1,5 +1,5 @@
-# .github/workflows/get-pr-from-closed-commit.yml
-name: Get PR that closed issue
+# .github/workflows/get-pr-from-comment.yml
+name: Get PR number from comment on reopen
 
 on:
   issues:
@@ -7,71 +7,53 @@ on:
 
 permissions:
   issues: read
-  contents: read
   pull-requests: read
+  contents: read
 
 jobs:
-  find-pr:
+  find-linked-pr:
     runs-on: ubuntu-latest
     steps:
-      - name: Find PR number
+      - name: Extract PR number from last PR link comment
         id: find
         uses: actions/github-script@v7
         with:
           result-encoding: string
           script: |
-            const {owner, repo} = context.repo;
+            const { owner, repo } = context.repo;
             const issue_number = context.payload.issue.number;
 
-            // 1) Find the last "closed" event that has a commit_id (i.e., closed by a commit)
-            let page = 1, closedEventCommit = null;
-            while (true) {
-              const res = await github.request(
-                'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
-                { owner, repo, issue_number, per_page: 100, page }
-              );
+            // Looks for any https://github.com/<o>/<r>/pull/<num> in the most recent comments
+            const prUrlRe = /https?:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/(\d+)\b/g;
 
-              for (const e of res.data) {
-                if (e.event === 'closed' && e.commit_id) {
-                  // keep the most recent closed-by-commit
-                  if (!closedEventCommit || new Date(e.created_at) > new Date(closedEventCommit.created_at)) {
-                    closedEventCommit = { sha: e.commit_id, created_at: e.created_at };
-                  }
+            let page = 1, prNumber = null;
+            while (!prNumber) {
+              const res = await github.rest.issues.listComments({
+                owner, repo, issue_number,
+                per_page: 100, page,
+                sort: 'created', direction: 'desc'
+              });
+
+              for (const c of res.data) {
+                let m;
+                while ((m = prUrlRe.exec(c.body || '')) !== null) {
+                  prNumber = m[1]; // take the first PR link in the newest comment that has one
+                  break;
                 }
+                if (prNumber) break;
               }
 
               if (res.data.length < 100) break;
               page++;
             }
 
-            if (!closedEventCommit) {
-              core.setFailed('No closing commit found for this issue.');
+            if (!prNumber) {
+              core.setFailed('No PR link found in the issue comments.');
               return;
             }
 
-            // 2) Ask GitHub which PR(s) are associated with that commit
-            // (This endpoint returns the PR that merged the commit, if any)
-            const pullsRes = await github.request(
-              'GET /repos/{owner}/{repo}/commits/{ref}/pulls',
-              {
-                owner,
-                repo,
-                ref: closedEventCommit.sha,
-                headers: { accept: 'application/vnd.github+json' } // modern media type
-              }
-            );
-
-            if (!pullsRes.data || pullsRes.data.length === 0) {
-              core.setFailed(`No PRs associated with closing commit ${closedEventCommit.sha}.`);
-              return;
-            }
-
-            // Prefer the PR that is merged/closed; otherwise just take the first
-            const merged = pullsRes.data.find(pr => pr.merged_at || pr.state === 'closed') || pullsRes.data[0];
-            const prNumber = merged.number;
-
-            core.setOutput('pr_number', String(prNumber));
-            return String(prNumber);
+            core.setOutput('pr_number', prNumber);
+            return prNumber;
 
       - name: Use it
-        run: echo "PR that closed this issue #${{ steps.find.outputs.result }}"
+        run: echo "PR number #${{ steps.find.outputs.result }}"
