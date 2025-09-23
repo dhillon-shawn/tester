@@ -8,7 +8,7 @@ permissions:
   contents: write
   pull-requests: write
   issues: write
-  workflows: write  
+
 
 jobs:
   hotfix_from_pr_head:
