@@ -1,59 +1,36 @@
-# .github/workflows/get-pr-from-comment.yml
-name: Get PR number from comment on reopen
-
+# .github/workflows/get-pr-on-reopen.yml
+name: Get PR number on issue reopen
 on:
   issues:
     types: [reopened]
 
 permissions:
   issues: read
-  pull-requests: read
-  contents: read
 
 jobs:
-  find-linked-pr:
+  get-pr:
     runs-on: ubuntu-latest
     steps:
-      - name: Extract PR number from last PR link comment
-        id: find
+      - id: find
         uses: actions/github-script@v7
         with:
           result-encoding: string
           script: |
-            const { owner, repo } = context.repo;
+            const {owner, repo} = context.repo;
             const issue_number = context.payload.issue.number;
+            const re = /https?:\/\/github\.com\/[^/]+\/[^/]+\/pull\/(\d+)/;
 
-            // Looks for any https://github.com/<o>/<r>/pull/<num> in the most recent comments
-            const prUrlRe = /https?:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/(\d+)\b/g;
-
-            let page = 1, prNumber = null;
-            while (!prNumber) {
-              const res = await github.rest.issues.listComments({
-                owner, repo, issue_number,
-                per_page: 100, page,
+            let page = 1, pr = null;
+            while (!pr) {
+              const {data} = await github.rest.issues.listComments({
+                owner, repo, issue_number, per_page: 100, page,
                 sort: 'created', direction: 'desc'
               });
-
-              for (const c of res.data) {
-                let m;
-                while ((m = prUrlRe.exec(c.body || '')) !== null) {
-                  prNumber = m[1]; // take the first PR link in the newest comment that has one
-                  break;
-                }
-                if (prNumber) break;
-              }
-
-              if (res.data.length < 100) break;
-              page++;
+              for (const c of data) { const m = re.exec(c.body || ''); if (m) { pr = m[1]; break; } }
+              if (data.length < 100) break; page++;
             }
-
-            if (!prNumber) {
-              core.setFailed('No PR link found in the issue comments.');
-              return;
-            }
-
-            core.setOutput('pr_number', prNumber);
-            return prNumber;
+            if (!pr) { core.setFailed('No PR URL found in comments.'); return; }
+            core.setOutput('pr_number', pr); return pr;
 
       - name: Use it
         run: echo "PR number #${{ steps.find.outputs.result }}"
