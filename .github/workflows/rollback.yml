@@ -1,23 +1,19 @@
-name: hotfix branch from reopened issue
+name: restore-branch-and-open-pr on issue reopen
 
 on:
   issues:
     types: [reopened]
 
 permissions:
-  write-all
-
+    write-all
 
 jobs:
-  hotfix_from_pr_head:
-    if: >
-      !contains(toJson(github.event.issue), '"pull_request"') &&
-      (contains(join(github.event.issue.labels.*.name, ','), 'release') ||
-       contains(join(github.event.issue.labels.*.name, ','), 'hotfix'))
+  restore_and_pr:
+    if: contains(join(github.event.issue.labels.*.name, ','), 'release') || contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
     runs-on: ubuntu-latest
 
     steps:
-      - name: find_merged_pr_and_meta
+      - name: find_merged_pr
         id: find
         uses: actions/github-script@v7
         with:
@@ -25,128 +21,82 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.issue.number;
 
-            // locate merged PR that closed this issue
             const query = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${issue_number}"`;
-            const search = await github.rest.search.issuesAndPullRequests({ q: query, per_page: 1, sort: 'updated', order: 'desc' });
+            const search = await github.rest.search.issuesAndPullRequests({
+              q: query, per_page: 1, sort: 'updated', order: 'desc'
+            });
             if (!search.data.items.length) core.setFailed(`no merged pr found for issue #${issue_number}`);
-            const pr_number = search.data.items[0].number;
 
+            const pr_number = search.data.items[0].number;
             const pr = (await github.rest.pulls.get({ ...repo, pull_number: pr_number })).data;
             if (!pr.merged) core.setFailed(`pr #${pr_number} is not merged`);
 
-            // optional: rc-meta.json via non-deprecated endpoints
-            let rc_version = '';
-            let rc_commit  = '';
-            try {
-              const rel = await github.rest.repos.getReleaseByTag({ ...repo, tag: `rc-pr-${pr_number}` });
-              const asset = (rel.data.assets || []).find(a => a.name === 'rc-meta.json');
-              if (asset) {
-                const bin = await github.rest.repos.getReleaseAsset({
-                  ...repo,
-                  asset_id: asset.id,
-                  headers: { accept: 'application/octet-stream' }
-                });
-                const meta = JSON.parse(Buffer.from(bin.data).toString('utf8'));
-                rc_version = meta.version || '';
-                rc_commit  = meta.commit  || '';
-              }
-            } catch (_) {}
-
             const issue = context.payload.issue;
             const issue_title = issue.title || pr.title || '';
-            const issue_body  = issue.body || '';
+            const issue_body  = issue.body  || '';
             const labels      = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
             const assignees   = (issue.assignees || []).map(a => a.login);
             const milestone   = issue.milestone ? String(issue.milestone.number) : '';
 
-            core.info(`issue=${issue_number} -> pr=${pr_number} base_ref=${pr.base.ref} pr_head_ref=${pr.head.ref} pr_head_sha=${pr.head.sha}`);
+            core.info(`restore target: pr=${pr.number} base=${pr.base.ref} head_ref=${pr.head.ref} head_sha=${pr.head.sha}`);
 
-            core.setOutput('pr_number', String(pr_number));
+            core.setOutput('pr_number', String(pr.number));
             core.setOutput('base_ref', pr.base.ref);
-            core.setOutput('pr_head_sha', pr.head.sha || '');
+            core.setOutput('head_ref', pr.head.ref || '');
+            core.setOutput('head_sha', pr.head.sha || '');
             core.setOutput('issue_title', issue_title);
             core.setOutput('issue_body', issue_body);
             core.setOutput('labels_json', JSON.stringify(labels));
             core.setOutput('assignees_json', JSON.stringify(assignees));
             core.setOutput('milestone', milestone);
-            core.setOutput('rc_version', rc_version);
-            core.setOutput('rc_commit', rc_commit);
 
-      - name: checkout_full
-        uses: actions/checkout@v4
+      - name: restore_branch_exact_name
+        id: restore
+        uses: actions/github-script@v7
         with:
-          # full history so we can test if pr_head_sha is already in the repo
-          fetch-depth: 0
-          ref: ${{ steps.find.outputs.base_ref }}
+          script: |
+            const repo = context.repo;
+            const head_ref = '${{ steps.find.outputs.head_ref }}';
+            const head_sha = '${{ steps.find.outputs.head_sha }}';
+            if (!head_ref || !head_sha) core.setFailed('missing head_ref or head_sha');
 
-      - name: create_hotfix_branch_pointing_to_existing_commit_if_possible
-        id: branch
-        env:
-          pr_number: ${{ steps.find.outputs.pr_number }}
-          issue_title: ${{ steps.find.outputs.issue_title }}
-          pr_head_sha: ${{ steps.find.outputs.pr_head_sha }}
-        run: |
-          set -euo pipefail
+            try {
+              // exact equivalent of “Restore branch”: recreate the ref at the PR head sha
+              await github.rest.git.createRef({ ...repo, ref: `refs/heads/${head_ref}`, sha: head_sha });
+              core.info(`restored branch: ${head_ref} @ ${head_sha}`);
+            } catch (e) {
+              if (e.status === 422) {
+                // already exists — that’s fine, just proceed
+                core.info(`branch already exists: ${head_ref}`);
+              } else {
+                throw e;
+              }
+            }
+            core.setOutput('restored_head', head_ref);
 
-          slug="$(printf "%s" "$issue_title" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g; s/^$/hotfix/')"
-          branch="hotfix/${pr_number}-${slug}"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # prefer to point at a commit that already exists in this repo (no new objects → no workflow permission issues)
-          use_sha=""
-          if [ -n "$pr_head_sha" ] && git cat-file -e "$pr_head_sha^{commit}" 2>/dev/null; then
-            use_sha="$pr_head_sha"
-            echo "source: pr_head_sha exists in repo: $use_sha"
-          else
-            echo "source: pr_head_sha not in repo; will use refs/pull/<pr>/head (may require workflow permission if it contains workflow-file changes)"
-            git fetch origin "pull/${pr_number}/head:refs/remotes/origin/pr-${pr_number}-head"
-            use_sha="$(git rev-parse "refs/remotes/origin/pr-${pr_number}-head")"
-            echo "fetched refs/pull/${pr_number}/head -> $use_sha"
-          fi
-
-          # create the branch ref pointing at use_sha WITHOUT creating any new commit
-          # we use 'git update-ref' locally + push the ref, which only creates a ref if objects are already present
-          git update-ref "refs/heads/$branch" "$use_sha" || true
-          set +e
-          git push origin "refs/heads/$branch:refs/heads/$branch"
-          rc=$?
-          set -e
-          if [ $rc -ne 0 ]; then
-            echo "::warning::push rejected. The PR head likely contains workflow-file changes and your GITHUB_TOKEN lacks 'workflows' permission. Options: (1) use a PAT with 'workflow' scope for this step, or (2) remove workflow-file changes from that hotfix."
-            exit 1
-          fi
-          echo "created branch $branch at $use_sha"
-
-      - name: open_hotfix_pr
+      - name: open_pr_from_restored_branch
+        id: open
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
             const base_ref = '${{ steps.find.outputs.base_ref }}';
-            const head_ref = '${{ steps.branch.outputs.branch }}';
+            const head_ref = '${{ steps.restore.outputs.restored_head }}';
             const pr_number = Number('${{ steps.find.outputs.pr_number }}');
 
-            const title = `fix: follow-up for pr #${pr_number}`;
-
-            const extras = [];
-            const rc_version = '${{ steps.find.outputs.rc_version }}';
-            const rc_commit  = '${{ steps.find.outputs.rc_commit }}';
-            if (rc_version) extras.push(`version: \`${rc_version}\``);
-            if (rc_commit)  extras.push(`release commit: \`${rc_commit}\``);
-            const prefix = extras.length ? extras.join('\n') + '\n\n' : '';
-
-            const body = prefix + [
-              `hotfix continuation created from ${'${{ steps.branch.outputs.branch }}'} pointing to the original pr head.`,
+            const title = `follow-up for pr #${pr_number}`;
+            const body  = [
+              `restored branch \`${head_ref}\` (matches the UI "Restore branch").`,
               '',
               '---',
               ${{ toJson(steps.find.outputs.issue_body) }}
             ].join('\n');
 
-            const pr = (await github.rest.pulls.create({ ...repo, title, head: head_ref, base: base_ref, body, draft: false })).data;
+            const pr = (await github.rest.pulls.create({
+              ...repo, title, head: head_ref, base: base_ref, body, draft: false
+            })).data;
 
+            // mirror issue metadata
             const labels = JSON.parse('${{ steps.find.outputs.labels_json }}');
             if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
 
@@ -157,4 +107,4 @@ jobs:
             const final_assignees = assignees.length ? assignees : ['${{ github.event.issue.user.login }}'];
             await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: final_assignees });
 
-            core.info(`hotfix pr opened: #${pr.number} ${pr.html_url}`)
+            core.info(`opened pr: #${pr.number} ${pr.html_url}`)
