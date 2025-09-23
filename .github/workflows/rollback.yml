@@ -34,3 +34,47 @@ jobs:
 
       - name: Use it
         run: echo "PR number ${{ steps.find.outputs.result }}"
+
+      - id: rc_meta
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = Number('${{ steps.find.outputs.result }}');
+            const releaseName = `rc-pr-${pr}`;
+
+            let release = null, page = 1;
+            while (!release) {
+              const res = await github.request('GET /repos/{owner}/{repo}/releases', {
+                owner, repo, per_page: 100, page
+              });
+              release = res.data.find(r => r.name === releaseName) || null;
+              if (release || res.data.length < 100) break;
+              page++;
+            }
+            if (!release) { core.setFailed(`Release not found: ${releaseName}`); return; }
+
+            const assets = await github.request('GET /repos/{owner}/{repo}/releases/{release_id}/assets', {
+              owner, repo, release_id: release.id, per_page: 100
+            });
+            const asset = assets.data.find(a => a.name === 'rc-meta.json');
+            if (!asset) { core.setFailed('rc-meta.json not found on release'); return; }
+
+            const resp = await fetch(asset.browser_download_url, {
+              headers: {
+                Authorization: `token ${process.env.GITHUB_TOKEN}`,
+                Accept: 'application/octet-stream'
+              }
+            });
+            if (!resp.ok) { core.setFailed(`Download failed: ${resp.status}`); return; }
+
+            const meta = await resp.json();
+            const version = meta.version ?? meta.semver ?? meta.tag ?? null;
+            if (!version) { core.setFailed('No "version" field in rc-meta.json'); return; }
+
+            core.setOutput('version', String(version));
+            return String(version);
+
+      - name: Use version
+        run: echo "Release version ${{ steps.rc_meta.outputs.result }}"
