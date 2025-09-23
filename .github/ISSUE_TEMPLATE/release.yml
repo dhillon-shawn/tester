@@ -1,0 +1,19 @@
+name: "Release"
+description: "Request a new release"
+labels: ["release"]
+body:
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      placeholder: One sentence summary
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: What problem does this solve? Any constraints?
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      placeholder: "Given/When/Then…"
