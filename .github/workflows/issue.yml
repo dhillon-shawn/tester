@@ -16,7 +16,7 @@ concurrency:
 jobs:
   issue_to_pr:
     if: >
-      contains(join(github.event.issue.labels.*.name, ','), 'feature') ||
+      contains(join(github.event.issue.labels.*.name, ','), 'release') ||
       contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
     runs-on: ubuntu-latest
 
@@ -50,7 +50,7 @@ jobs:
             const num = context.payload.issue.number;
             const { data: issue } = await github.rest.issues.get({ ...repo, issue_number: num });
             const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
-            const mode = labels.includes('hotfix') ? 'hotfix' : 'feature';
+            const mode = labels.includes('hotfix') ? 'hotfix' : 'release';
             core.info(`issue: #${num} | mode=${mode} | labels=[${labels.join(', ')}] | assignees=[${(issue.assignees||[]).map(a=>a.login).join(', ')}]`);
             core.setOutput('title', issue.title || '');
             core.setOutput('body', issue.body || '');
@@ -72,8 +72,8 @@ jobs:
             const title = rawTitle || mode;
             const slug = title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,50) || mode;
             const branch = `${mode}/${nextPrNumber}-${slug}`;
-            const isDraft = mode === 'feature';
-            const prefix = isDraft ? 'feat: ' : 'fix: ';
+            const isDraft = mode === 'release';
+            const prefix = isDraft ? 'Release: ' : 'Hotfix: ';
             core.info(`meta: issue=${issueNum} -> planned_pr=${nextPrNumber} | mode=${mode} | draft=${isDraft} | branch=${branch} | default=${defaultBranch}`);
             core.setOutput('default', defaultBranch);
             core.setOutput('branch', branch);
