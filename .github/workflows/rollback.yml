@@ -1,4 +1,5 @@
 name: rollback on issue reopen
+
 on:
   issues:
     types: [reopened]
@@ -34,7 +35,7 @@ jobs:
             const pr = (await github.rest.pulls.get({ ...repo, pull_number: prNum })).data;
             if (!pr.merged) core.setFailed(`PR #${prNum} not merged`);
 
-            core.info(`issue=#${n} -> pr=#${pr.number} base=${pr.base.ref} merge_sha=${pr.merge_commit_sha || '(none)'} head_sha=${pr.head.sha} head_ref=${pr.head.ref}`);
+            core.info(`resolve: issue=${n} pr=${pr.number} base=${pr.base.ref} head_ref=${pr.head.ref} head_sha=${pr.head.sha}`);
 
             // rc-meta.json on tag rc-pr-<PR#>
             let meta = {};
@@ -48,20 +49,21 @@ jobs:
                 meta = JSON.parse(Buffer.from(bin.data).toString('utf8'));
                 core.info(`rc-meta: version=${meta.version || ''} commit=${meta.commit || ''}`);
               } else {
-                core.info('rc-meta: asset not found');
+                core.info('rc-meta: rc-meta.json not found');
               }
             } catch { core.info('rc-meta: tag not found'); }
 
+            const iss = context.payload.issue;
             core.setOutput('pr_node_id', pr.node_id);
             core.setOutput('pr_number', String(pr.number));
+            core.setOutput('base_ref', pr.base.ref);
             core.setOutput('head_sha', pr.head.sha || '');
             core.setOutput('head_ref', pr.head.ref || '');
-            core.setOutput('title', pr.title || '');
-            core.setOutput('issue_title', context.payload.issue.title || '');
-            core.setOutput('issue_body', context.payload.issue.body || '');
-            core.setOutput('labels', JSON.stringify((context.payload.issue.labels||[]).map(l => typeof l === 'string' ? l : l.name)));
-            core.setOutput('assignees', JSON.stringify((context.payload.issue.assignees||[]).map(a => a.login)));
-            core.setOutput('milestone', context.payload.issue.milestone ? String(context.payload.issue.milestone.number) : '');
+            core.setOutput('title', iss.title || pr.title || '');
+            core.setOutput('body', iss.body || '');
+            core.setOutput('labels', JSON.stringify((iss.labels||[]).map(l => typeof l === 'string' ? l : l.name)));
+            core.setOutput('assignees', JSON.stringify((iss.assignees||[]).map(a => a.login)));
+            core.setOutput('milestone', iss.milestone ? String(iss.milestone.number) : '');
             core.setOutput('rc_meta', JSON.stringify(meta));
 
       - name: revert PR (GraphQL)
@@ -70,20 +72,18 @@ jobs:
         with:
           script: |
             const prId = '${{ steps.find.outputs.pr_node_id }}';
-            const mutation = `
+            const m = `
               mutation($input: RevertPullRequestInput!) {
-                revertPullRequest(input: $input) {
-                  pullRequest { number url }
-                }
+                revertPullRequest(input: $input) { pullRequest { number url } }
               }`;
-            const out = await github.graphql(mutation, { input: { pullRequestId: prId }});
-            const r = out?.revertPullRequest?.pullRequest;
-            if (!r) core.setFailed('revertPullRequest failed');
-            core.info(`revert PR: #${r.number} ${r.url}`);
-            core.setOutput('number', String(r.number));
-            core.setOutput('url', r.url);
+            const r = await github.graphql(m, { input: { pullRequestId: prId }});
+            const pr = r?.revertPullRequest?.pullRequest;
+            if (!pr) core.setFailed('revertPullRequest failed');
+            core.info(`revert: pr=${pr.number} url=${pr.url}`);
+            core.setOutput('number', String(pr.number));
+            core.setOutput('url', pr.url);
 
-      - name: annotate revert PR (labels/milestone/assignees)
+      - name: annotate revert PR
         uses: actions/github-script@v7
         with:
           script: |
@@ -96,17 +96,16 @@ jobs:
             const asg = JSON.parse('${{ steps.find.outputs.assignees }}');
             await github.rest.issues.addAssignees({ ...repo, issue_number: num, assignees: asg.length ? asg : ['${{ github.event.issue.user.login }}'] });
 
-      - name: create restore branch (best-effort)
+      - name: recreate original branch (same name, best-effort)
         uses: actions/github-script@v7
         with:
           script: |
             try {
               const repo = context.repo;
               const sha = '${{ steps.find.outputs.head_sha }}';
-              if (!sha) { core.info('restore: no head sha'); return; }
-              const refName = ( '${{ steps.find.outputs.head_ref }}' || `pr-${'${{ steps.find.outputs.pr_number }}'}` )
-                .toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'') || `pr-${'${{ steps.find.outputs.pr_number }}'}`;
-              const ref = `refs/heads/restore/pr-${'${{ steps.find.outputs.pr_number }}'}-${refName}`;
+              const name = '${{ steps.find.outputs.head_ref }}';
+              if (!sha || !name) { core.info('restore: no head info'); return; }
+              const ref = `refs/heads/${name}`;
               await github.rest.git.createRef({ ...repo, ref, sha });
               core.info(`restore: ${ref} @ ${sha}`);
             } catch (e) {
