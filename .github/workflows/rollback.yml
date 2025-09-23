@@ -1,5 +1,5 @@
-# .github/workflows/get-linked-pr.yml
-name: Get linked PR on reopen
+# .github/workflows/get-pr-from-closed-commit.yml
+name: Get PR that closed issue
 
 on:
   issues:
@@ -7,95 +7,71 @@ on:
 
 permissions:
   issues: read
-  pull-requests: read
   contents: read
+  pull-requests: read
 
 jobs:
-  linked-pr:
+  find-pr:
     runs-on: ubuntu-latest
     steps:
-      - name: Find linked PR number
+      - name: Find PR number
         id: find
         uses: actions/github-script@v7
         with:
           result-encoding: string
           script: |
-            const { owner, repo } = context.repo;
-            const issue = context.payload.issue.number;
+            const {owner, repo} = context.repo;
+            const issue_number = context.payload.issue.number;
 
-            const query = `
-              query($owner:String!, $repo:String!, $issue:Int!) {
-                repository(owner:$owner, name:$repo) {
-                  issue(number:$issue) {
-                    timelineItems(itemTypes:[CONNECTED_EVENT, CROSS_REFERENCED_EVENT], first:100) {
-                      nodes {
-                        __typename
-                        ... on ConnectedEvent {
-                          subject {
-                            __typename
-                            ... on PullRequest {
-                              number
-                              merged
-                              mergedAt
-                              updatedAt
-                              state
-                            }
-                          }
-                        }
-                        ... on CrossReferencedEvent {
-                          willClose
-                          source {
-                            __typename
-                            ... on PullRequest {
-                              number
-                              merged
-                              mergedAt
-                              updatedAt
-                              state
-                            }
-                          }
-                        }
-                      }
-                    }
+            // 1) Find the last "closed" event that has a commit_id (i.e., closed by a commit)
+            let page = 1, closedEventCommit = null;
+            while (true) {
+              const res = await github.request(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/events',
+                { owner, repo, issue_number, per_page: 100, page }
+              );
+
+              for (const e of res.data) {
+                if (e.event === 'closed' && e.commit_id) {
+                  // keep the most recent closed-by-commit
+                  if (!closedEventCommit || new Date(e.created_at) > new Date(closedEventCommit.created_at)) {
+                    closedEventCommit = { sha: e.commit_id, created_at: e.created_at };
                   }
                 }
               }
-            `;
 
-            const data = await github.graphql(query, { owner, repo, issue });
-
-            // collect PRs from both "Linked pull requests" (ConnectedEvent)
-            // and closing-keyword refs (CrossReferencedEvent)
-            const prs = [];
-            for (const n of data.repository.issue.timelineItems.nodes) {
-              if (n.__typename === 'ConnectedEvent' && n.subject?.number) {
-                prs.push(n.subject);
-              } else if (n.__typename === 'CrossReferencedEvent' && n.source?.number) {
-                // If you only want PRs that would close the issue, uncomment the next line:
-                // if (!n.willClose) continue;
-                prs.push(n.source);
-              }
+              if (res.data.length < 100) break;
+              page++;
             }
 
-            // de-dupe by PR number
-            const map = new Map();
-            for (const pr of prs) map.set(pr.number, pr);
-
-            if (map.size === 0) {
-              core.setFailed('No linked pull request found for this issue.');
+            if (!closedEventCommit) {
+              core.setFailed('No closing commit found for this issue.');
               return;
             }
 
-            // pick the most recently merged PR; otherwise most recently updated
-            const byMerged = [...map.values()]
-              .filter(pr => pr.merged && pr.mergedAt)
-              .sort((a,b) => new Date(b.mergedAt) - new Date(a.mergedAt));
+            // 2) Ask GitHub which PR(s) are associated with that commit
+            // (This endpoint returns the PR that merged the commit, if any)
+            const pullsRes = await github.request(
+              'GET /repos/{owner}/{repo}/commits/{ref}/pulls',
+              {
+                owner,
+                repo,
+                ref: closedEventCommit.sha,
+                headers: { accept: 'application/vnd.github+json' } // modern media type
+              }
+            );
 
-            const best = byMerged[0] ||
-              [...map.values()].sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0];
+            if (!pullsRes.data || pullsRes.data.length === 0) {
+              core.setFailed(`No PRs associated with closing commit ${closedEventCommit.sha}.`);
+              return;
+            }
 
-            core.setOutput('pr_number', String(best.number));
-            return String(best.number);
+            // Prefer the PR that is merged/closed; otherwise just take the first
+            const merged = pullsRes.data.find(pr => pr.merged_at || pr.state === 'closed') || pullsRes.data[0];
+            const prNumber = merged.number;
+
+            core.setOutput('pr_number', String(prNumber));
+            return String(prNumber);
 
       - name: Use it
-        run: echo "Linked PR #${{ steps.find.outputs.result }}"
+        run: echo "PR that closed this issue #${{ steps.find.outputs.result }}"
