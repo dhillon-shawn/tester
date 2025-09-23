@@ -10,92 +10,136 @@ permissions:
 jobs:
   rc-version:
     runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      contents: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      RC_META_PATH: rc-meta.json   # change if your file lives elsewhere
+      RC_META_PATH: rc-meta.json
 
     steps:
-      - name: Get PR that closed this issue (from timeline "closed in #<PR>")
-        id: pr
+      - name: Resolve merged PR that closed this issue (events → commit → pulls)
+        id: find
         shell: bash
         run: |
           set -euo pipefail
-          set -x
 
-          owner="${GITHUB_REPOSITORY%/*}"
-          repo="${GITHUB_REPOSITORY#*/}"
-          issue="${{ github.event.issue.number }}"
+          # helpers
+          die(){ echo "::error::$*"; exit 1; }
+          note(){ echo "::notice::$*"; }
 
-          # Look for the final "closed" timeline event that carries a PR in `source.issue`
-          pr_number=$(
-            gh api "repos/$owner/$repo/issues/$issue/timeline" \
-              --paginate \
-              -H "Accept: application/vnd.github+json" \
-              --jq '
-                [ .[]
-                  | select(
-                      .event == "closed"
-                      and .source != null
-                      and .source.type == "issue"
-                      and (.source.issue.pull_request|type) == "object"
-                    )
-                ]
-                | last
-                | .source.issue.number // empty
-              '
-          )
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          ISSUE="${{ github.event.issue.number }}"
+          note "Owner=$OWNER Repo=$REPO Issue=#$ISSUE"
 
-          if [[ -z "${pr_number:-}" ]]; then
-            echo "No closing PR found in issue timeline for #$issue" >&2
-            exit 1
+          # 1) find the closing commit from the issue's events
+          EVENTS_JSON=$(gh api "repos/$OWNER/$REPO/issues/$ISSUE/events" --paginate)
+          CLOSE_SHA=$(jq -r '[ .[] | select(.event=="closed" and .commit_id!=null) ] | last | .commit_id // empty' <<<"$EVENTS_JSON")
+
+          if [[ -z "$CLOSE_SHA" ]]; then
+            die "No closing commit found in events for issue #$ISSUE"
           fi
+          note "Closing commit: $CLOSE_SHA"
 
-          # (Optional) ensure that PR is merged
-          merged=$(gh api "repos/$owner/$repo/pulls/$pr_number" --jq '.merged')
-          if [[ "$merged" != "true" ]]; then
-            echo "PR #$pr_number is not merged (merged=$merged)" >&2
-            exit 1
-          fi
+          # 2) PRs associated with that commit
+          PULLS_JSON=$(gh api "repos/$OWNER/$REPO/commits/$CLOSE_SHA/pulls" -H "Accept: application/vnd.github+json")
+          CANDIDATES=($(jq -r '.[].number' <<<"$PULLS_JSON"))
+          [[ ${#CANDIDATES[@]} -gt 0 ]] || die "No PRs associated with closing commit $CLOSE_SHA"
 
-          rc_tag="rc-pr-${pr_number}"
+          # 3) keep only merged; pick latest by merged_at
+          BEST_PR=""; BEST_MERGED_AT=""
+          for N in "${CANDIDATES[@]}"; do
+            PR_JSON=$(gh api "repos/$OWNER/$REPO/pulls/$N")
+            MERGED=$(jq -r '.merged' <<<"$PR_JSON")
+            MERGED_AT=$(jq -r '.merged_at // ""' <<<"$PR_JSON")
+            note "PR #$N merged=$MERGED merged_at=$MERGED_AT"
+            if [[ "$MERGED" == "true" && -n "$MERGED_AT" ]]; then
+              if [[ -z "$BEST_MERGED_AT" || "$MERGED_AT" > "$BEST_MERGED_AT" ]]; then
+                BEST_PR="$N"; BEST_MERGED_AT="$MERGED_AT"; BEST_JSON="$PR_JSON"
+              fi
+            fi
+          done
 
-          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
-          echo "rc_tag=$rc_tag"       >> "$GITHUB_OUTPUT"
+          [[ -n "$BEST_PR" ]] || die "No merged PR among candidates: ${CANDIDATES[*]}"
 
-          echo "Resolved closing PR: #$pr_number"
-          echo "Derived tag: $rc_tag"
+          PR_NUMBER="$BEST_PR"
+          PR_NODE_ID=$(jq -r '.node_id' <<<"$BEST_JSON")
+          BASE_REF=$(jq -r '.base.ref' <<<"$BEST_JSON")
+          HEAD_REF=$(jq -r '.head.ref' <<<"$BEST_JSON")
+          HEAD_SHA=$(jq -r '.head.sha // ""' <<<"$BEST_JSON")
+          TITLE=$(jq -r '.title' <<<"$BEST_JSON")
 
-      - name: Download rc-meta.json and extract version
+          # grab data from the issue payload file for parity with your script
+          ISSUE_JSON=$(cat "$GITHUB_EVENT_PATH")
+          ISS_TITLE=$(jq -r '.issue.title // ""' <<<"$ISSUE_JSON")
+          ISS_BODY=$(jq -r '.issue.body // ""' <<<"$ISSUE_JSON")
+          LABELS=$(jq -c '[.issue.labels[] | ( .name // . ) ]' <<<"$ISSUE_JSON")
+          ASSIGNEES=$(jq -c '[.issue.assignees[]?.login]' <<<"$ISSUE_JSON")
+          MILESTONE=$(jq -r '.issue.milestone?.number // ""' <<<"$ISSUE_JSON")
+
+          RC_TAG="rc-pr-${PR_NUMBER}"
+
+          note "Resolved: PR=#$PR_NUMBER tag=$RC_TAG base=$BASE_REF head_ref=$HEAD_REF head_sha=${HEAD_SHA:0:7}"
+
+          echo "pr_node_id=$PR_NODE_ID"    >> "$GITHUB_OUTPUT"
+          echo "pr_number=$PR_NUMBER"      >> "$GITHUB_OUTPUT"
+          echo "base_ref=$BASE_REF"        >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA"        >> "$GITHUB_OUTPUT"
+          echo "head_ref=$HEAD_REF"        >> "$GITHUB_OUTPUT"
+          echo "title=$ISS_TITLE"          >> "$GITHUB_OUTPUT"
+          echo "body=$ISS_BODY"            >> "$GITHUB_OUTPUT"
+          echo "labels=$LABELS"            >> "$GITHUB_OUTPUT"
+          echo "assignees=$ASSIGNEES"      >> "$GITHUB_OUTPUT"
+          echo "milestone=$MILESTONE"      >> "$GITHUB_OUTPUT"
+          echo "rc_tag=$RC_TAG"            >> "$GITHUB_OUTPUT"
+
+      - name: Fetch rc-meta.json from rc-pr-<PR> and expose version
         id: meta
         shell: bash
         run: |
           set -euo pipefail
-          set -x
+          die(){ echo "::error::$*"; exit 1; }
+          note(){ echo "::notice::$*"; }
 
-          owner="${GITHUB_REPOSITORY%/*}"
-          repo="${GITHUB_REPOSITORY#*/}"
-          rc_tag="${{ steps.pr.outputs.rc_tag }}"
-          meta_path="${RC_META_PATH}"
-          out="meta/$(basename "$meta_path")"
-          mkdir -p meta
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          RC_TAG="${{ steps.find.outputs.rc_tag }}"
+          META_PATH="${RC_META_PATH}"
+          OUTDIR="meta"; mkdir -p "$OUTDIR"
+          TARGET="$OUTDIR/$(basename "$META_PATH")"
 
-          # Try release asset first; if not there, fetch the file at ref=rc_tag
-          if gh release view "$rc_tag" >/dev/null 2>&1; then
-            gh release download "$rc_tag" -p "$(basename "$meta_path")" -D meta >/dev/null 2>&1 \
-              || gh api "repos/$owner/$repo/contents/$meta_path?ref=$rc_tag" --jq '.content' | base64 -d > "$out"
+          note "Looking for release $RC_TAG / asset $(basename "$META_PATH")"
+          if gh release view "$RC_TAG" >/dev/null 2>&1; then
+            if gh release download "$RC_TAG" -p "$(basename "$META_PATH")" -D "$OUTDIR" >/dev/null 2>&1; then
+              note "Downloaded rc-meta.json from release asset"
+            else
+              note "Asset not found; fetching file from repo at ref=$RC_TAG"
+              gh api "repos/$OWNER/$REPO/contents/$META_PATH?ref=$RC_TAG" --jq '.content' | base64 -d > "$TARGET" \
+                || die "Could not fetch $META_PATH at ref $RC_TAG"
+            fi
           else
-            gh api "repos/$owner/$repo/contents/$meta_path?ref=$rc_tag" --jq '.content' | base64 -d > "$out"
+            note "Release not found; fetching file from repo at ref=$RC_TAG"
+            gh api "repos/$OWNER/$REPO/contents/$META_PATH?ref=$RC_TAG" --jq '.content' | base64 -d > "$TARGET" \
+              || die "Could not fetch $META_PATH at ref $RC_TAG"
           fi
 
-          [[ -s "$out" ]] || { echo "rc-meta.json not found at $meta_path in $rc_tag"; exit 1; }
+          [[ -s "$TARGET" ]] || die "rc-meta.json missing/empty at $META_PATH for $RC_TAG"
 
-          version=$(jq -r '.version // .Version // .VERSION // empty' "$out")
-          [[ -n "$version" && "$version" != "null" ]] || { echo "No version key in $out"; exit 1; }
+          VERSION=$(jq -r '.version // .Version // .VERSION // empty' "$TARGET")
+          COMMIT=$(jq -r '.commit // empty' "$TARGET")
+          [[ -n "$VERSION" ]] || die "No 'version' field in $TARGET"
 
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # mirror your script's output contract
+          PR_NUMBER="${{ steps.find.outputs.pr_number }}"
+          PR_NODE_ID="${{ steps.find.outputs.pr_node_id }}"
+          echo "version=$VERSION"                 >> "$GITHUB_OUTPUT"
+          echo "rc_meta=$(jq -c . "$TARGET")"     >> "$GITHUB_OUTPUT"
 
+          note "rc-meta: version=$VERSION commit=${COMMIT:-n/a}"
           {
-            echo "PR:       ${{ steps.pr.outputs.pr_number }}"
-            echo "RC Tag:   $rc_tag"
-            echo "Version:  $version"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "### RC Meta"
+            echo "- PR: #$PR_NUMBER"
+            echo "- Tag: \`$RC_TAG\`"
+            echo "- Version: \`$VERSION\`"
+          } >> "$GITHUB_STEP_SUMMARY"
