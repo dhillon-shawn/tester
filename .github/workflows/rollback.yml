@@ -5,9 +5,7 @@ on:
     types: [reopened]
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
+    write-all
 
 jobs:
   hotfix_from_pr_head:
