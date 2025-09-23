@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RC_META_PATH: rc-meta.json   # change if your file lives elsewhere in the tag/release
+      GH_TOKEN: ${{ github.token }}
     outputs:
       version: ${{ steps.extract.outputs.version }}
       rc_name: ${{ steps.find_pr.outputs.rc_name }}
