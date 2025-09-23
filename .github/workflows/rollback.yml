@@ -19,117 +19,89 @@ jobs:
       pr_number: ${{ steps.find_pr.outputs.pr_number }}
 
     steps:
-      - name: Ensure gh is authenticated
-        run: |
-          gh auth status || gh auth login --with-token <<< "${GITHUB_TOKEN}"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Find merged PR that closed this issue → rc tag (REST)
+      id: find-pr
+      env:
+        ISSUE_NUMBER: ${{ github.event.issue.number }}
+      shell: bash
+      run: |
+        set -euo pipefail
 
-      - name: Derive repo/issue context
-        id: ctx
-        run: |
-          IFS='/' read -r OWNER REPO <<< "${GITHUB_REPOSITORY}"
-          echo "owner=${OWNER}" >> $GITHUB_OUTPUT
-          echo "repo=${REPO}" >> $GITHUB_OUTPUT
-          echo "issue=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+        owner="${GITHUB_REPOSITORY%/*}"
+        repo="${GITHUB_REPOSITORY#*/}"
+        issue="$ISSUE_NUMBER"
 
-      - name: Find latest merged PR that closed this issue
-        id: find_pr
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OWNER: ${{ steps.ctx.outputs.owner }}
-          REPO: ${{ steps.ctx.outputs.repo }}
-          ISSUE: ${{ steps.ctx.outputs.issue }}
-        run: |
-          # Query cross-reference events and filter to PRs that would close the issue (willCloseTarget)
-          Q='
-          query($owner:String!, $repo:String!, $issue:Int!) {
-            repository(owner:$owner, name:$repo) {
-              issue(number:$issue) {
-                timelineItems(itemTypes: CROSS_REFERENCED_EVENT, first: 100) {
-                  nodes {
-                    ... on CrossReferencedEvent {
-                      willCloseTarget
-                      source {
-                        __typename
-                        ... on PullRequest {
-                          number
-                          merged
-                          mergedAt
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }'
-          RESP=$(gh api graphql -f owner="$OWNER" -f repo="$REPO" -F issue="$ISSUE" -f query="$Q")
+        # 1) Get all timeline events and pull out cross-references that "will close" this issue
+        #    then extract candidate PR numbers
+        candidates=$(gh api \
+          "repos/$owner/$repo/issues/$issue/timeline" \
+          --paginate \
+          --jq '
+            map(select(.event=="cross-referenced"
+                      and .will_close_target==true
+                      and .source.type=="issue"
+                      and (.source.issue.pull_request|type)=="object"))
+            | map(.source.issue.number)
+            | unique
+            | .[]')
 
-          # Pick the most recently merged PR that had "Closes #<issue>" (willCloseTarget==true)
-          PR_NUMBER=$(echo "$RESP" | jq -r '
-            .data.repository.issue.timelineItems.nodes
-            | map(select(.willCloseTarget == true and .source.__typename == "PullRequest" and .source.merged == true))
-            | sort_by(.source.mergedAt) | last | .source.number // empty
-          ')
+        if [[ -z "${candidates:-}" ]]; then
+          echo "No cross-referenced PRs that would close issue #$issue" >&2
+          exit 1
+        fi
 
-          if [ -z "$PR_NUMBER" ] || [ "$PR_NUMBER" = "null" ]; then
-            echo "No merged PR found that closed this issue." >&2
-            exit 1
-          fi
-
-          RC_NAME="rc-pr-${PR_NUMBER}"
-          echo "pr_number=${PR_NUMBER}" >> $GITHUB_OUTPUT
-          echo "rc_name=${RC_NAME}" >> $GITHUB_OUTPUT
-          echo "Found PR #$PR_NUMBER -> ${RC_NAME}"
-
-      - name: Download rc-meta.json (prefer release asset; fallback to tag content)
-        id: get_meta
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OWNER: ${{ steps.ctx.outputs.owner }}
-          REPO: ${{ steps.ctx.outputs.repo }}
-          RC_NAME: ${{ steps.find_pr.outputs.rc_name }}
-          RC_META_PATH: ${{ env.RC_META_PATH }}
-        run: |
-          set -e
-          mkdir -p meta
-          echo "Attempting to download '${RC_META_PATH}' from release ${RC_NAME}..."
-          if gh release view "$RC_NAME" >/dev/null 2>&1; then
-            # Try to download the asset directly (pattern match)
-            if gh release download "$RC_NAME" -p "$(basename "$RC_META_PATH")" -D meta >/dev/null 2>&1; then
-              echo "Downloaded release asset to meta/$(basename "$RC_META_PATH")"
-            else
-              echo "Asset not found in release; will try repo contents at ref ${RC_NAME}..."
-              # Fall through to repo contents fetch
-              gh api \
-                "repos/${OWNER}/${REPO}/contents/${RC_META_PATH}?ref=${RC_NAME}" \
-                --jq '.content' | base64 -d > "meta/$(basename "$RC_META_PATH")"
-              echo "Downloaded from repo contents ref ${RC_NAME}."
+        # 2) Keep only merged PRs, pick the most recent by merged_at
+        best_pr=""
+        best_merged_at=""
+        for n in $candidates; do
+          # query PR once and parse merged + merged_at
+          read -r merged merged_at < <(gh api "repos/$owner/$repo/pulls/$n" --jq '.merged, .merged_at')
+          if [[ "$merged" == "true" ]]; then
+            if [[ -z "$best_merged_at" || "$merged_at" > "$best_merged_at" ]]; then
+              best_pr="$n"
+              best_merged_at="$merged_at"
             fi
-          else
-            echo "Release ${RC_NAME} not found; fetching from repo contents at ref ${RC_NAME}..."
-            gh api \
-              "repos/${OWNER}/${REPO}/contents/${RC_META_PATH}?ref=${RC_NAME}" \
-              --jq '.content' | base64 -d > "meta/$(basename "$RC_META_PATH")"
           fi
+        done
 
-      - name: Extract version from rc-meta.json
-        id: extract
-        run: |
-          FILE="meta/$(basename "${{ env.RC_META_PATH }}")"
-          test -s "$FILE" || { echo "rc-meta not found"; exit 1; }
-          VERSION=$(jq -r '.version // .Version // .VERSION // empty' "$FILE")
-          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo "No 'version' field found in $FILE" >&2
-            exit 1
-          fi
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Resolved RC version: $VERSION"
+        if [[ -z "${best_pr:-}" ]]; then
+          echo "No merged PR found among cross-references for issue #$issue" >&2
+          exit 1
+        fi
 
-      - name: Summary
-        run: |
-          echo "Issue #${{ steps.ctx.outputs.issue }}"
-          echo "PR #${{ steps.find_pr.outputs.pr_number }}"
-          echo "RC: ${{ steps.find_pr.outputs.rc_name }}"
-          echo "Version: ${{ steps.extract.outputs.version }}"
+        rc_tag="rc-pr-${best_pr}"
+
+        echo "pr_number=$best_pr"  >> "$GITHUB_OUTPUT"
+        echo "rc_tag=$rc_tag"      >> "$GITHUB_OUTPUT"
+
+    - name: Download rc-meta.json (release asset or tag) and extract version
+      id: get-meta
+      env:
+        RC_META_PATH: rc-meta.json
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        owner="${GITHUB_REPOSITORY%/*}"
+        repo="${GITHUB_REPOSITORY#*/}"
+        rc_tag="${{ steps.find-pr.outputs.rc_tag }}"
+        meta_path="$RC_META_PATH"
+
+        mkdir -p meta
+        target="meta/$(basename "$meta_path")"
+
+        if gh release view "$rc_tag" >/dev/null 2>&1; then
+          gh release download "$rc_tag" -p "$(basename "$meta_path")" -D meta >/dev/null 2>&1 \
+            || gh api "repos/$owner/$repo/contents/$meta_path?ref=$rc_tag" --jq '.content' | base64 -d > "$target"
+        else
+          gh api "repos/$owner/$repo/contents/$meta_path?ref=$rc_tag" --jq '.content' | base64 -d > "$target"
+        fi
+
+        [[ -s "$target" ]] || { echo "rc-meta.json missing at $meta_path in $rc_tag"; exit 1; }
+
+        version=$(jq -r '.version // .Version // .VERSION // empty' "$target")
+        [[ -n "$version" && "$version" != "null" ]] || { echo "No version key in $target"; exit 1; }
+
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "RC: $rc_tag"
+        echo "Version: $version"
