@@ -1,5 +1,5 @@
-# .github/workflows/closing-pr-on-reopen.yml
-name: Find last closing PR when issue reopens
+# .github/workflows/get-linked-pr.yml
+name: Get linked PR on reopen
 
 on:
   issues:
@@ -11,47 +11,91 @@ permissions:
   contents: read
 
 jobs:
-  find-last-closing-pr:
+  linked-pr:
     runs-on: ubuntu-latest
     steps:
-      - name: Get PR that last closed this issue
+      - name: Find linked PR number
         id: find
         uses: actions/github-script@v7
         with:
           result-encoding: string
           script: |
-            const {owner, repo} = context.repo;
-            const issue_number = context.payload.issue.number;
+            const { owner, repo } = context.repo;
+            const issue = context.payload.issue.number;
 
-            let page = 1, last = null;
-            while (true) {
-              const res = await github.request(
-                'GET /repos/{owner}/{repo}/issues/{issue_number}/timeline',
-                { owner, repo, issue_number, per_page: 100, page }
-              );
-
-              for (const e of res.data) {
-                // Look for PRs that referenced this issue with "will close" semantics (e.g. "fixes #123")
-                if (e.event === 'cross-referenced' && e.will_close && e.source?.issue?.pull_request) {
-                  const prNum = e.source.issue.number;
-                  const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNum });
-                  if (pr.data.merged_at) {
-                    if (!last || new Date(pr.data.merged_at) > new Date(last.merged_at)) {
-                      last = { number: pr.data.number, merged_at: pr.data.merged_at };
+            const query = `
+              query($owner:String!, $repo:String!, $issue:Int!) {
+                repository(owner:$owner, name:$repo) {
+                  issue(number:$issue) {
+                    timelineItems(itemTypes:[CONNECTED_EVENT, CROSS_REFERENCED_EVENT], first:100) {
+                      nodes {
+                        __typename
+                        ... on ConnectedEvent {
+                          subject {
+                            __typename
+                            ... on PullRequest {
+                              number
+                              merged
+                              mergedAt
+                              updatedAt
+                              state
+                            }
+                          }
+                        }
+                        ... on CrossReferencedEvent {
+                          willClose
+                          source {
+                            __typename
+                            ... on PullRequest {
+                              number
+                              merged
+                              mergedAt
+                              updatedAt
+                              state
+                            }
+                          }
+                        }
+                      }
                     }
                   }
                 }
               }
+            `;
 
-              if (res.data.length < 100) break;
-              page++;
+            const data = await github.graphql(query, { owner, repo, issue });
+
+            // collect PRs from both "Linked pull requests" (ConnectedEvent)
+            // and closing-keyword refs (CrossReferencedEvent)
+            const prs = [];
+            for (const n of data.repository.issue.timelineItems.nodes) {
+              if (n.__typename === 'ConnectedEvent' && n.subject?.number) {
+                prs.push(n.subject);
+              } else if (n.__typename === 'CrossReferencedEvent' && n.source?.number) {
+                // If you only want PRs that would close the issue, uncomment the next line:
+                // if (!n.willClose) continue;
+                prs.push(n.source);
+              }
             }
 
-            if (!last) {
-              core.setFailed('No merged PR found that closed this issue.');
+            // de-dupe by PR number
+            const map = new Map();
+            for (const pr of prs) map.set(pr.number, pr);
+
+            if (map.size === 0) {
+              core.setFailed('No linked pull request found for this issue.');
               return;
             }
-            return String(last.number);
+
+            // pick the most recently merged PR; otherwise most recently updated
+            const byMerged = [...map.values()]
+              .filter(pr => pr.merged && pr.mergedAt)
+              .sort((a,b) => new Date(b.mergedAt) - new Date(a.mergedAt));
+
+            const best = byMerged[0] ||
+              [...map.values()].sort((a,b) => new Date(b.updatedAt) - new Date(a.updatedAt))[0];
+
+            core.setOutput('pr_number', String(best.number));
+            return String(best.number);
 
       - name: Use it
-        run: echo "Last closing PR number ${{ steps.find.outputs.result }}"
+        run: echo "Linked PR #${{ steps.find.outputs.result }}"
