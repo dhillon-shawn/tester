@@ -1,146 +1,138 @@
-name: Create branch and PR for issues
+name: hotfix branch from reopened issue
 
 on:
   issues:
-    types: [opened]
+    types: [reopened]
 
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-
-concurrency:
-  group: issues
-  cancel-in-progress: true
+  write-all
 
 jobs:
-  issue_to_pr:
-    if: >
-      contains(join(github.event.issue.labels.*.name, ','), 'release') ||
-      contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
+  hotfix_from_pr_head:
+    if: contains(join(github.event.issue.labels.*.name, ','), 'release') || contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
     runs-on: ubuntu-latest
 
     steps:
-      - name: assign check
-        id: check
-        run: |
-          echo "issue_number=${{ github.event.issue.number }}"
-          echo "assignees_json=${{ toJson(github.event.issue.assignees) }}"
-          if [ "${{ toJson(github.event.issue.assignees) }}" = "[]" ]; then
-            echo "has_assignees=false" >> $GITHUB_OUTPUT
-            echo "result=no current assignee"
-          else
-            echo "has_assignees=true" >> $GITHUB_OUTPUT
-            echo "result=already assigned"
-          fi
-
-      - name: assign ensure
-        if: steps.check.outputs.has_assignees == 'false'
-        uses: pozil/auto-assign-issue@v2
-        with:
-          assignees: "${{ github.event.issue.user.login }}"
-          numOfAssignee: 1
-
-      - name: issue refresh
-        id: issue
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const repo = context.repo;
-            const num = context.payload.issue.number;
-            const { data: issue } = await github.rest.issues.get({ ...repo, issue_number: num });
-            const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
-            const mode = labels.includes('hotfix') ? 'hotfix' : 'release';
-            core.info(`issue: #${num} | mode=${mode} | labels=[${labels.join(', ')}] | assignees=[${(issue.assignees||[]).map(a=>a.login).join(', ')}]`);
-            core.setOutput('title', issue.title || '');
-            core.setOutput('body', issue.body || '');
-            core.setOutput('labels', JSON.stringify(labels));
-            core.setOutput('assignees', JSON.stringify((issue.assignees || []).map(a => a.login)));
-            core.setOutput('milestone', issue.milestone ? String(issue.milestone.number) : '');
-            core.setOutput('mode', mode);
-
-      - name: meta derive
-        id: meta
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const issueNum = context.payload.issue.number;
-            const nextPrNumber = issueNum + 1;
-            const defaultBranch = context.payload.repository.default_branch;
-            const mode = '${{ steps.issue.outputs.mode }}';
-            const rawTitle = ${{ toJson(steps.issue.outputs.title) }};
-            const title = rawTitle || mode;
-            const slug = title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,50) || mode;
-            const branch = `${mode}/${nextPrNumber}-${slug}`;
-            const isDraft = mode === 'release';
-            const prefix = isDraft ? 'Release: ' : 'Hotfix: ';
-            core.info(`meta: issue=${issueNum} -> planned_pr=${nextPrNumber} | mode=${mode} | draft=${isDraft} | branch=${branch} | default=${defaultBranch}`);
-            core.setOutput('default', defaultBranch);
-            core.setOutput('branch', branch);
-            core.setOutput('plannedPr', String(nextPrNumber));
-            core.setOutput('isDraft', String(isDraft));
-            core.setOutput('prefix', prefix);
-            core.setOutput('slug', slug);
-
-      - name: checkout default
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ steps.meta.outputs.default }}
-
-      - name: branch init
-        env:
-          BRANCH: ${{ steps.meta.outputs.branch }}
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
-          MODE: ${{ steps.issue.outputs.mode }}
-        run: |
-          echo "creating branch=$BRANCH from default=${{ steps.meta.outputs.default }} for issue #$ISSUE_NUMBER mode=$MODE"
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$BRANCH"
-          git commit --allow-empty -m "chore: init $MODE branch for #$ISSUE_NUMBER [skip ci]"
-          git push --set-upstream origin "$BRANCH"
-          echo "pushed branch=$BRANCH"
-
-      - name: pr open
-        id: createpr
+      - name: find_merged_pr_and_meta
+        id: find
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
             const issue_number = context.payload.issue.number;
-            const base = '${{ steps.meta.outputs.default }}';
-            const head = '${{ steps.meta.outputs.branch }}';
-            const isDraft = '${{ steps.meta.outputs.isDraft }}' === 'true';
-            const title = '${{ steps.meta.outputs.prefix }}' + ${{ toJson(steps.issue.outputs.title) }};
-            const body = [
-              `${isDraft ? 'Draft PR' : 'PR'} for issue #${issue_number}`,
-              '',
-              `Closes #${issue_number}`,
-              '',
-              '---',
-              ${{ toJson(steps.issue.outputs.body) }}
-            ].join('\n');
-            const { data: pr } = await github.rest.pulls.create({ ...repo, title, head, base, body, draft: isDraft });
-            const labels = JSON.parse('${{ steps.issue.outputs.labels }}');
-            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
-            const milestone = '${{ steps.issue.outputs.milestone }}';
-            if (milestone) await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
-            const assignees = JSON.parse('${{ steps.issue.outputs.assignees }}');
-            const finalAssignees = assignees.length ? assignees : ['${{ github.event.issue.user.login }}'];
-            await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: finalAssignees });
-            core.info(`pr: actual=${pr.number} | planned=${'${{ steps.meta.outputs.plannedPr }}'} | url=${pr.html_url} | head=${head} -> base=${base} | draft=${isDraft}`);
-            core.setOutput('pr_number', String(pr.number));
-            core.setOutput('pr_url', pr.html_url)
 
-      - name: pr verify
-        if: always()
+            // find merged pr that closed this issue
+            const query = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${issue_number}"`;
+            const search = await github.rest.search.issuesAndPullRequests({ q: query, per_page: 1, sort: 'updated', order: 'desc' });
+            if (!search.data.items.length) core.setFailed(`no merged pr found for issue #${issue_number}`);
+            const pr_number = search.data.items[0].number;
+
+            const pr = (await github.rest.pulls.get({ ...repo, pull_number: pr_number })).data;
+            if (!pr.merged) core.setFailed(`pr #${pr_number} is not merged`);
+
+            // optional rc-meta.json (no generic GET calls)
+            let rc_version = '';
+            let rc_commit  = '';
+            try {
+              const rel = await github.rest.repos.getReleaseByTag({ ...repo, tag: `rc-pr-${pr_number}` });
+              const asset = (rel.data.assets || []).find(a => a.name === 'rc-meta.json');
+              if (asset) {
+                const bin = await github.rest.repos.getReleaseAsset({
+                  ...repo,
+                  asset_id: asset.id,
+                  headers: { accept: 'application/octet-stream' }
+                });
+                const meta = JSON.parse(Buffer.from(bin.data).toString('utf8'));
+                rc_version = meta.version || '';
+                rc_commit  = meta.commit  || '';
+              }
+            } catch (_) {}
+
+            const issue = context.payload.issue;
+            const issue_title = issue.title || pr.title || '';
+            const issue_body  = issue.body || '';
+            const labels      = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
+            const assignees   = (issue.assignees || []).map(a => a.login);
+            const milestone   = issue.milestone ? String(issue.milestone.number) : '';
+
+            core.info(`issue=${issue_number} -> pr=${pr_number} base_ref=${pr.base.ref}`);
+
+            core.setOutput('pr_number', String(pr_number));
+            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('issue_title', issue_title);
+            core.setOutput('issue_body', issue_body);
+            core.setOutput('labels_json', JSON.stringify(labels));
+            core.setOutput('assignees_json', JSON.stringify(assignees));
+            core.setOutput('milestone', milestone);
+            core.setOutput('rc_version', rc_version);
+            core.setOutput('rc_commit', rc_commit);
+
+      - name: checkout_minimal
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: create_hotfix_branch_from_pr_head
+        id: branch
+        env:
+          pr_number: ${{ steps.find.outputs.pr_number }}
+          issue_title: ${{ steps.find.outputs.issue_title }}
+        run: |
+          set -euo pipefail
+          slug="$(printf "%s" "$issue_title" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g; s/^$/hotfix/')"
+          branch="hotfix/${pr_number}-${slug}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # fetch immutable pr head ref that github keeps (works for old merges / deleted branches / forks)
+          git fetch origin pull/${pr_number}/head:refs/remotes/origin/pr-${pr_number}-head
+          git switch --detach origin/pr-${pr_number}-head
+          git switch -c "$branch"
+
+          # empty commit so pr always opens cleanly
+          git commit --allow-empty -m "chore: initialize hotfix from pr #${pr_number} [skip ci]"
+          git push --set-upstream origin "$branch"
+
+          echo "created and pushed $branch from refs/pull/${pr_number}/head"
+
+      - name: open_hotfix_pr
+        id: pr_open
         uses: actions/github-script@v7
         with:
           script: |
-            const planned = Number('${{ steps.meta.outputs.plannedPr }}');
-            const actual  = Number('${{ steps.createpr.outputs.pr_number }}');
-            if (planned !== actual) {
-              core.warning(`verify: planned_pr=${planned} != actual_pr=${actual} (branch remains '${{ steps.meta.outputs.branch }}')`);
-            } else {
-              core.info(`verify: planned_pr matches actual_pr=${actual}`);
-            }
+            const repo = context.repo;
+            const base_ref = '${{ steps.find.outputs.base_ref }}';
+            const head_ref = '${{ steps.branch.outputs.branch }}';
+            const pr_number = Number('${{ steps.find.outputs.pr_number }}');
+
+            const title = `fix: follow-up for pr #${pr_number}`;
+
+            const lines = [];
+            const rc_version = '${{ steps.find.outputs.rc_version }}';
+            const rc_commit  = '${{ steps.find.outputs.rc_commit }}';
+            if (rc_version) lines.push(`version: \`${rc_version}\``);
+            if (rc_commit)  lines.push(`release commit: \`${rc_commit}\``);
+            const front_matter = lines.length ? lines.join('\n') + '\n\n' : '';
+
+            const body = front_matter + [
+              `hotfix continuation created from github's persistent ref \`refs/pull/${pr_number}/head\`.`,
+              '',
+              '---',
+              ${{ toJson(steps.find.outputs.issue_body) }}
+            ].join('\n');
+
+            const pr = (await github.rest.pulls.create({ ...repo, title, head: head_ref, base: base_ref, body, draft: false })).data;
+
+            const labels = JSON.parse('${{ steps.find.outputs.labels_json }}');
+            if (labels.length) await github.rest.issues.addLabels({ ...repo, issue_number: pr.number, labels });
+
+            const milestone = '${{ steps.find.outputs.milestone }}';
+            if (milestone) await github.rest.issues.update({ ...repo, issue_number: pr.number, milestone: Number(milestone) });
+
+            const assignees = JSON.parse('${{ steps.find.outputs.assignees_json }}');
+            const final_assignees = assignees.length ? assignees : ['${{ github.event.issue.user.login }}'];
+            await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: final_assignees });
+
+            core.info(`hotfix pr opened: #${pr.number} ${pr.html_url}`)

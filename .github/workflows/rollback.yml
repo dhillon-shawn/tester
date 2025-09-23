@@ -21,20 +21,14 @@ jobs:
             const repo = context.repo;
             const issue_number = context.payload.issue.number;
 
-            // find merged PR that closed this issue
             const query = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${issue_number}"`;
             const search = await github.rest.search.issuesAndPullRequests({ q: query, per_page: 1, sort: 'updated', order: 'desc' });
-            if (!search.data.items.length) core.setFailed(`no merged PR found for issue #${issue_number}`);
+            if (!search.data.items.length) core.setFailed(`no merged pr found for issue #${issue_number}`);
             const pr_number = search.data.items[0].number;
 
             const pr = (await github.rest.pulls.get({ ...repo, pull_number: pr_number })).data;
-            if (!pr.merged) core.setFailed(`PR #${pr_number} is not merged`);
+            if (!pr.merged) core.setFailed(`pr #${pr_number} is not merged`);
 
-            const issue = context.payload.issue;
-            const title = issue.title || pr.title || '';
-            const body = issue.body || '';
-
-            // optional: read rc-meta.json via non-deprecated endpoints
             let rc_version = '';
             let rc_commit  = '';
             try {
@@ -52,16 +46,19 @@ jobs:
               }
             } catch (_) {}
 
-            const labels = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
-            const assignees = (issue.assignees || []).map(a => a.login);
-            const milestone = issue.milestone ? String(issue.milestone.number) : '';
+            const issue = context.payload.issue;
+            const issue_title = issue.title || pr.title || '';
+            const issue_body  = issue.body || '';
+            const labels      = (issue.labels || []).map(l => typeof l === 'string' ? l : l.name);
+            const assignees   = (issue.assignees || []).map(a => a.login);
+            const milestone   = issue.milestone ? String(issue.milestone.number) : '';
 
-            core.info(`issue=${issue_number} -> pr=${pr_number} base_ref=${pr.base.ref} pr_head_ref=${pr.head.ref}`);
+            core.info(`issue=${issue_number} -> pr=${pr_number} base_ref=${pr.base.ref}`);
 
             core.setOutput('pr_number', String(pr_number));
             core.setOutput('base_ref', pr.base.ref);
-            core.setOutput('issue_title', title);
-            core.setOutput('issue_body', body);
+            core.setOutput('issue_title', issue_title);
+            core.setOutput('issue_body', issue_body);
             core.setOutput('labels_json', JSON.stringify(labels));
             core.setOutput('assignees_json', JSON.stringify(assignees));
             core.setOutput('milestone', milestone);
@@ -87,13 +84,11 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # fetch immutable PR head ref kept by GitHub
           git fetch origin pull/${pr_number}/head:refs/remotes/origin/pr-${pr_number}-head
           git switch --detach origin/pr-${pr_number}-head
           git switch -c "$branch"
 
-          # empty commit so PR always opens cleanly
-          git commit --allow-empty -m "chore: initialize hotfix from PR #${pr_number} [skip ci]"
+          git commit --allow-empty -m "initialize hotfix from pr #${pr_number} [skip ci]"
           git push --set-upstream origin "$branch"
 
           echo "created and pushed $branch from refs/pull/${pr_number}/head"
@@ -108,15 +103,22 @@ jobs:
             const head_ref = '${{ steps.branch.outputs.branch }}';
             const pr_number = Number('${{ steps.find.outputs.pr_number }}');
 
-            const title = `fix: follow-up for PR #${pr_number}`;
+            const title = `fix: follow-up for pr #${pr_number}`;
+
             const lines = [];
             const rc_version = '${{ steps.find.outputs.rc_version }}';
             const rc_commit  = '${{ steps.find.outputs.rc_commit }}';
-            if (rc_version) lines.push(`Version: \`${rc_version}\``);
-            if (rc_commit)  lines.push(`Release commit: \`${rc_commit}\``);
-            const extra = lines.length ? lines.join('\n') + '\n\n' : '';
+            if (rc_version) lines.push(`version: \`${rc_version}\``);
+            if (rc_commit)  lines.push(`release commit: \`${rc_commit}\``);
+            const front_matter = lines.length ? lines.join('\n') + '\n\n' : '';
 
-            const body = extra + 'Hotfix continuation from GitHub PR head ref.';
+            const body = front_matter + [
+              `hotfix continuation created from github's persistent ref \`refs/pull/${pr_number}/head\`.`,
+              '',
+              '---',
+              ${{ toJson(steps.find.outputs.issue_body) }}
+            ].join('\n');
+
             const pr = (await github.rest.pulls.create({ ...repo, title, head: head_ref, base: base_ref, body, draft: false })).data;
 
             const labels = JSON.parse('${{ steps.find.outputs.labels_json }}');
@@ -129,4 +131,4 @@ jobs:
             const final_assignees = assignees.length ? assignees : ['${{ github.event.issue.user.login }}'];
             await github.rest.issues.addAssignees({ ...repo, issue_number: pr.number, assignees: final_assignees });
 
-            core.info(`hotfix PR opened: #${pr.number} ${pr.html_url}`)
+            core.info(`hotfix pr opened: #${pr.number} ${pr.html_url}`)
