@@ -17,81 +17,133 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: resolve merged PR
+      - name: resolve merged PR (and rc-meta)
         id: find
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
-            const n = context.payload.issue.number;
-            const q = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${n}"`;
+            const issueNum = context.payload.issue.number;
+
+            // merged PR that closed this issue
+            const q = `repo:${repo.owner}/${repo.repo} is:pr is:merged in:body "Closes #${issueNum}"`;
             const s = await github.rest.search.issuesAndPullRequests({ q, per_page: 1, sort: 'updated', order: 'desc' });
-            if (!s.data.items.length) core.setFailed(`no merged PR found for #${n}`);
+            if (!s.data.items.length) core.setFailed(`no merged PR found for issue #${issueNum}`);
             const prNum = s.data.items[0].number;
+
             const pr = (await github.rest.pulls.get({ ...repo, pull_number: prNum })).data;
             if (!pr.merged) core.setFailed(`PR #${prNum} not merged`);
-            // optional: read rc-meta.json for logging
+
+            // Optional: read rc-meta.json from tag rc-pr-<PR#> (non-deprecated endpoints)
             try {
-              const rel = await github.request('GET /repos/{owner}/{repo}/releases/tags/{tag}', {
-                owner: repo.owner, repo: repo.repo, tag: `rc-pr-${pr.number}`
-              });
+              const rel = await github.rest.repos.getReleaseByTag({ ...repo, tag: `rc-pr-${pr.number}` });
               const asset = (rel.data.assets || []).find(a => a.name === 'rc-meta.json');
               if (asset) {
-                const bin = await github.request('GET ' + asset.url, { headers: { Accept: 'application/octet-stream' } });
+                const bin = await github.request('GET /repos/{owner}/{repo}/releases/assets/{asset_id}', {
+                  owner: repo.owner, repo: repo.repo, asset_id: asset.id,
+                  headers: { accept: 'application/octet-stream' }
+                });
                 const meta = JSON.parse(Buffer.from(bin.data).toString('utf8'));
                 core.info(`rc-meta: version=${meta.version || ''} commit=${meta.commit || ''}`);
               }
             } catch {}
+
+            // outputs
             core.setOutput('pr_node_id', pr.node_id);
             core.setOutput('pr_number', String(pr.number));
             core.setOutput('base_ref', pr.base.ref);
-            core.setOutput('head_sha', pr.head.sha || '');
             core.setOutput('head_ref', pr.head.ref || '');
+            core.setOutput('head_sha', pr.head.sha || '');
             core.setOutput('title', pr.title || '');
 
-      - name: open revert PR (GraphQL)
+      - name: open revert PR
         id: revert
         uses: actions/github-script@v7
         with:
           script: |
             const prId = '${{ steps.find.outputs.pr_node_id }}';
             const m = `mutation($input: RevertPullRequestInput!){
-              revertPullRequest(input:$input){ pullRequest{ number url mergeable state } } }`;
+              revertPullRequest(input:$input){ pullRequest{ number url headRefName baseRefName } }
+            }`;
             const r = await github.graphql(m, { input: { pullRequestId: prId }});
             const rp = r?.revertPullRequest?.pullRequest;
             if (!rp) core.setFailed('revertPullRequest failed');
-            core.info(`revert PR opened: #${rp.number} ${rp.url} state=${rp.state} mergeable=${rp.mergeable}`);
+            core.info(`revert PR: #${rp.number} ${rp.url} head=${rp.headRefName} base=${rp.baseRefName}`);
             core.setOutput('number', String(rp.number));
 
-      - name: merge revert PR immediately  # requires “Allow specified actors to bypass required pull requests”
+      - name: approve + merge revert PR (requires your branch protection to allow Actions to approve/merge)
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
             const num = Number('${{ steps.revert.outputs.number }}');
-            // choose your merge method; squash is typical for revert PRs
-            await github.rest.pulls.merge({ ...repo, pull_number: num, merge_method: 'squash' });
-            core.info(`revert PR #${num} merged`)
 
-      - name: create hotfix branch at original head and open PR
+            // approve
+            try {
+              await github.rest.pulls.createReview({
+                ...repo, pull_number: num, event: 'APPROVE', body: 'Auto-approval by rollback workflow'
+              });
+              core.info(`approved revert PR #${num}`);
+            } catch (e) {
+              core.info(`approve skipped: ${e.status || ''} ${e.message}`);
+            }
+
+            // merge (squash is typical; use 'merge' if you prefer)
+            await github.rest.pulls.merge({ ...repo, pull_number: num, merge_method: 'squash' });
+            core.info(`merged revert PR #${num}`);
+
+      - name: create hotfix branch at original head + empty commit, then open PR
         uses: actions/github-script@v7
         with:
           script: |
             const repo = context.repo;
             const prNum = Number('${{ steps.find.outputs.pr_number }}');
-            const headSha = '${{ steps.find.outputs.head_sha }}';
+            const base = '${{ steps.find.outputs.base_ref }}';
+            const headRefOrig = '${{ steps.find.outputs.head_ref }}';
+            const headShaOrig = '${{ steps.find.outputs.head_sha }}';
             const title = '${{ steps.find.outputs.title }}' || `pr-${prNum}`;
             const slug = title.toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-+|-+$/g,'').slice(0,50) || `pr-${prNum}`;
-            const newRef = `refs/heads/hotfix/${prNum}-${slug}`;
-            if (!headSha) { core.info('no head sha; skip'); return; }
-            // create branch
-            await github.rest.git.createRef({ ...repo, ref: newRef, sha: headSha }).catch(e => {
-              if (e.status !== 422) throw e; // already exists is fine
+            const branch = `hotfix/${prNum}-${slug}`;
+
+            if (!headShaOrig) { core.info('no original head sha; skipping hotfix branch'); return; }
+
+            // 1) create hotfix branch at original head sha
+            try {
+              await github.rest.git.createRef({ ...repo, ref: `refs/heads/${branch}`, sha: headShaOrig });
+              core.info(`created branch ${branch} @ ${headShaOrig}`);
+            } catch (e) {
+              if (e.status !== 422) throw e; // 422 means ref exists
+              core.info(`branch ${branch} already exists`);
+            }
+
+            // 2) create an EMPTY COMMIT via Git database API (same tree, new commit)
+            // get the commit and tree of the current tip
+            const baseCommit = (await github.rest.git.getCommit({ ...repo, commit_sha: headShaOrig })).data;
+            const treeSha = baseCommit.tree.sha;
+
+            // create a new commit with the same tree and parent=branch tip
+            const commit = (await github.rest.git.createCommit({
+              ...repo,
+              message: `chore: initialize hotfix from PR #${prNum} [skip ci]`,
+              tree: treeSha,
+              parents: [headShaOrig]
+            })).data;
+
+            // move branch to the new commit (fast-forward)
+            await github.rest.git.updateRef({
+              ...repo,
+              ref: `heads/${branch}`,
+              sha: commit.sha,
+              force: false
             });
-            // open PR back to default
-            const base = '${{ steps.find.outputs.base_ref }}';
-            const head = `hotfix/${prNum}-${slug}`;
+            core.info(`empty commit ${commit.sha} on ${branch}`);
+
+            // 3) open PR back to default
             const { data: pr } = await github.rest.pulls.create({
-              ...repo, title: `fix: follow-up for PR #${prNum}`, head, base, body: `Continuation branch from original head of PR #${prNum}.`
+              ...repo,
+              title: `fix: follow-up for PR #${prNum}`,
+              head: branch,
+              base,
+              body: `Hotfix continuation from original head \`${headRefOrig}\` of PR #${prNum}.`
             });
-            core.info(`hotfix PR opened: #${pr.number} ${pr.html_url}`)
+            core.info(`hotfix PR opened: #${pr.number} ${pr.html_url}`);
