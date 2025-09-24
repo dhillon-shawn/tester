@@ -173,11 +173,12 @@ jobs:
             })
               
             
-      - name: Parse issue → simple outputs
+      - name: Parse issue → simple outputs (robust checkboxes)
         id: parse
         uses: actions/github-script@v7
         with:
           script: |
+            const core = require('@actions/core');
             const issue = context.payload.issue;
             if (!issue) { core.setFailed('No issue payload.'); return; }
             const body = '\n' + (issue.body || '') + '\n';
@@ -195,14 +196,47 @@ jobs:
               return block(label).split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
             }
 
-            const cb = block('Confirmations').split('\n');
-            const pick = (label) => {
-              const row = cb.find(l => new RegExp(`^-\\s*\\[( |x|X)\\]\\s*${esc(label)}\\s*$`).test(l));
-              if (!row) return 'No';
-              const m = row.match(/^-\\s*\\[( |x|X)\\]/);
-              return (m && (m[1] === 'x' || m[1] === 'X')) ? 'Yes' : 'No';
+            // ---------- Robust checkbox parsing ----------
+            const normalize = (s) =>
+              s.toLowerCase()
+              .replace(/\(.*?\)/g, ' ')     // drop parenthetical notes
+              .replace(/[^a-z0-9\s]/g, ' ') // strip punctuation
+              .replace(/\s+/g, ' ')         // collapse whitespace
+              .trim();
+
+            const cbBlock = block('Confirmations');
+            const cbLines = cbBlock.split('\n').map(l => l.trim());
+
+            // Collect found checkboxes from the body
+            const found = {}; // normLabel -> 'Yes'/'No'
+            for (const l of cbLines) {
+              const m = l.match(/^[*-]\s*\[( |x|X)\]\s*(.+?)\s*$/);
+              if (!m) continue;
+              const checked = (m[1].toLowerCase() === 'x');
+              const labelNorm = normalize(m[2]);
+              found[labelNorm] = checked ? 'Yes' : 'No';
+            }
+
+            // Targets we care about (normalized)
+            const targets = {
+              public:  'impacts the public',
+              cdt:     'involves cdt',
+              new_app: 'new app esd needs to know'
             };
 
+            // Default to 'No' and fill from found (supports minor text changes)
+            const pickByIncludes = (needle) => {
+              for (const k of Object.keys(found)) {
+                if (k === needle || k.includes(needle)) return found[k];
+              }
+              return 'No';
+            };
+
+            const publicYN  = pickByIncludes(targets.public);
+            const cdtYN     = pickByIncludes(targets.cdt);
+            const newAppYN  = pickByIncludes(targets.new_app);
+
+            // ---------- Other fields ----------
             const out = {
               start:         line('Start date'),
               end:           line('End date'),
@@ -215,16 +249,15 @@ jobs:
               notified_when: line('When were impacted users last notified?'),
               notified_how:  line('How were impacted users last notified?'),
               backup:        line('Backup contact (email)'),
-              public:        pick('Impacts the public.'),
-              cdt:           pick('Involves CDT.'),
-              new_app:       pick('New app (ESD needs to know).'),
+              public:        publicYN,
+              cdt:           cdtYN,
+              new_app:       newAppYN,
               issue:         String(issue.number),
               title:         issue.title || '',
               url:           issue.html_url || ''
             };
 
             Object.entries(out).forEach(([k,v]) => core.setOutput(k, v ?? ''));
-            [out.emails, out.backup].filter(Boolean).forEach(core.setSecret);
               
               
 
