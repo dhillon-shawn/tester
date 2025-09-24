@@ -1,0 +1,177 @@
+name: Change / Release Request
+description: Propose a change with dates, justification, plan, risks, and impacted users.
+title: ""
+labels:
+  - change-request
+body:
+  # ─────────────── Top: type-into fields ───────────────
+  - type: markdown
+    attributes:
+      value: "## Details"
+
+  - type: input
+    id: request_title
+    attributes:
+      label: Title
+      description: Short name for this change (this is **separate** from the GitHub issue title above).
+      placeholder: "e.g., Phase 1: Data Lake schema migration"
+    validations:
+      required: true
+
+  - type: input
+    id: start_date
+    attributes:
+      label: Start date
+      description: "Use **YYYY-MM-DD** (copy/paste from a calendar is okay)."
+      placeholder: "YYYY-MM-DD"
+    validations:
+      required: true
+
+  - type: input
+    id: end_date
+    attributes:
+      label: End date
+      description: "Use **YYYY-MM-DD**. End date must be on/after Start date."
+      placeholder: "YYYY-MM-DD"
+    validations:
+      required: true
+
+  - type: input
+    id: effort_project
+    attributes:
+      label: Effort / Project
+      description: "Effort estimate or sizing + project/program name."
+      placeholder: "e.g., ~5 person-days | Project: Atlas Modernization"
+    validations:
+      required: true
+
+  - type: textarea
+    id: justification
+    attributes:
+      label: Justification
+      placeholder: "Why this change is needed, expected outcomes, business/technical rationale…"
+    validations:
+      required: true
+
+  - type: textarea
+    id: implementation_plan
+    attributes:
+      label: Implementation plan
+      description: "Key steps, owners, environments, checkpoints, and rollback. Use lists for clarity."
+      placeholder: |
+        1) Prepare staging environment…
+        2) Run DB migration…
+        3) Verify dashboards…
+        4) Roll out to prod behind feature flag…
+        5) Post-deployment validation…
+    validations:
+      required: true
+
+  - type: textarea
+    id: risk
+    attributes:
+      label: Risk
+      description: "Top risks, likelihood/impact, and mitigations/rollback."
+      placeholder: |
+        - Risk: Potential API 429s during reindex
+        - Mitigation: throttle jobs; expand pool
+        - Rollback: revert to snapshot N-1
+    validations:
+      required: true
+
+  - type: input
+    id: impacted_users_emails
+    attributes:
+      label: Impacted users (emails)
+      description: "List emails; separate with commas or new lines."
+      placeholder: "user1@example.com, user2@example.com"
+    validations:
+      required: true
+
+  - type: input
+    id: last_notified_when
+    attributes:
+      label: When were impacted users last notified?
+      description: "Use **YYYY-MM-DD** or a clear timestamp if known."
+      placeholder: "YYYY-MM-DD"
+    validations:
+      required: true
+
+  - type: input
+    id: backup_contact
+    attributes:
+      label: Backup contact (email)
+      placeholder: "oncall@example.com"
+    validations:
+      required: true
+
+  # ─────────────── Middle: dropdowns ───────────────
+  - type: markdown
+    attributes:
+      value: "## Communication & Groups"
+
+  - type: dropdown
+    id: last_notified_how
+    attributes:
+      label: How were impacted users last notified?
+      options:
+        - Meeting
+        - Teams message
+        - Email
+    validations:
+      required: true
+
+  - type: textarea
+    id: impacted_groups
+    attributes:
+      label: Impacted groups
+      description: "Teams, business units, or customer segments. If many, use bullets."
+      placeholder: |
+        - Customer Success
+        - Data Engineering
+        - External API consumers (partners)
+    validations:
+      required: true
+
+  # ─────────────── Bottom: “radio buttons” (single-choice) ───────────────
+  # GitHub Issue Forms don’t have native radios; use single-select dropdowns with no default.
+  - type: markdown
+    attributes:
+      value: "## Compliance & Exposure"
+
+  - type: dropdown
+    id: impacts_public
+    attributes:
+      label: Does this impact the public?
+      options:
+        - Yes
+        - No
+    validations:
+      required: true
+
+  - type: dropdown
+    id: involves_cdt
+    attributes:
+      label: Does this involve CDT?
+      options:
+        - Yes
+        - No
+    validations:
+      required: true
+
+  - type: dropdown
+    id: new_app_esd
+    attributes:
+      label: Is this a new app (does ESD need to know)?
+      options:
+        - Yes
+        - No
+    validations:
+      required: true
+
+  # ─────────────── Footer helper ───────────────
+  - type: markdown
+    attributes:
+      value: >
+        _Tip: after submission, consider linking this issue to a **Project** item with
+        a **Date** field for native calendar pickers, timeline views, and automations._
