@@ -9,7 +9,7 @@ body:
     attributes:
       value: |
         ## Details
-        _Dates and high-level info._
+        _Dates_
 
   - type: input
     id: start_date
@@ -27,11 +27,16 @@ body:
     validations:
       required: true
 
-  - type: input
-    id: effort_project
+  - type: dropdown
+    id: effort
     attributes:
-      label: Effort / Project
-      placeholder: "Project / effort"
+      label: Effort/Project
+        - Defect Resolution
+        - Executive Sponsor Projects
+        - Maintenance and Operation
+        - Legistlative Mandate
+        - User Request
+        - Test Environment
     validations:
       required: true
 
@@ -40,7 +45,7 @@ body:
     attributes:
       value: |
         ## Rationale
-        _Why, how, and risks—keep it brief._
+        _Why, how, and risks_
 
   - type: textarea
     id: justification

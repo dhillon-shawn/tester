@@ -14,7 +14,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  issue_to_pr:
+  parse:
+    outputs:
+      start:         ${{ steps.parse.outputs.start }}
+      end:           ${{ steps.parse.outputs.end }}
+      effort:        ${{ steps.parse.outputs.effort }}
+      why:           ${{ steps.parse.outputs.why }}
+      plan:          ${{ steps.parse.outputs.plan }}
+      risk:          ${{ steps.parse.outputs.risk }}
+      groups:        ${{ steps.parse.outputs.groups }}
+      emails:        ${{ steps.parse.outputs.emails }}
+      notified_when: ${{ steps.parse.outputs.notified_when }}
+      notified_how:  ${{ steps.parse.outputs.notified_how }}
+      backup:        ${{ steps.parse.outputs.backup }}
+      public:        ${{ steps.parse.outputs.public }}
+      cdt:           ${{ steps.parse.outputs.cdt }}
+      new_app:       ${{ steps.parse.outputs.new_app }}
+      title:         ${{ steps.parse.outputs.title }}
+      url:           ${{ steps.parse.outputs.url }}
     if: >
       contains(join(github.event.issue.labels.*.name, ','), 'release') ||
       contains(join(github.event.issue.labels.*.name, ','), 'hotfix')
@@ -144,6 +161,7 @@ jobs:
             } else {
               core.info(`verify: planned_pr matches actual_pr=${actual}`);
             }
+
       - name: Comment PR link on the issue (optional)
         uses: actions/github-script@v7
         with:
@@ -153,3 +171,83 @@ jobs:
               issue_number: context.payload.issue.number,
               body: `Opened ${'${{ steps.issue.outputs.mode }}' === 'feature' ? 'draft ' : ''}PR: ${{ steps.createpr.outputs.pr_url }}\nBranch: \`${{ steps.meta.outputs.branch }}\``
             })
+              
+            
+      - name: Parse issue → simple outputs
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const core = require('@actions/core');
+            const issue = context.payload.issue;
+            if (!issue) { core.setFailed('No issue payload.'); return; }
+            const body = '\n' + (issue.body || '') + '\n';
+            const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+            function block(label) {
+              const re = new RegExp(
+                `\\n\\s*#{1,6}\\s*${esc(label)}\\s*\\n([\\s\\S]*?)(?=\\n\\s*#{1,6}\\s*|$)`,
+                'i'
+              );
+              const m = body.match(re);
+              return (m ? m[1].trim() : '');
+            }
+            function line(label) {
+              return block(label).split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
+            }
+
+            const cb = block('Confirmations').split('\n');
+            const pick = (label) => {
+              const row = cb.find(l => new RegExp(`^-\\s*\\[( |x|X)\\]\\s*${esc(label)}\\s*$`).test(l));
+              if (!row) return 'No';
+              const m = row.match(/^-\\s*\\[( |x|X)\\]/);
+              return (m && (m[1] === 'x' || m[1] === 'X')) ? 'Yes' : 'No';
+            };
+
+            const out = {
+              start:         line('Start date'),
+              end:           line('End date'),
+              effort:        line('Effort/Project'),
+              why:           block('Justification'),
+              plan:          block('Implementation plan'),
+              risk:          block('Risk'),
+              groups:        line('Impacted groups'),
+              emails:        line('Impacted users (emails)'),
+              notified_when: line('When were impacted users last notified?'),
+              notified_how:  line('How were impacted users last notified?'),
+              backup:        line('Backup contact (email)'),
+              public:        pick('Impacts the public.'),
+              cdt:           pick('Involves CDT.'),
+              new_app:       pick('New app (ESD needs to know).'),
+              issue:         String(issue.number),
+              title:         issue.title || '',
+              url:           issue.html_url || ''
+            };
+
+            Object.entries(out).forEach(([k,v]) => core.setOutput(k, v ?? ''));
+            [out.emails, out.backup].filter(Boolean).forEach(core.setSecret);
+              
+              
+
+  use-values:
+    needs: parse
+    if: needs.parse.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Demo simple outputs
+        run: |
+          echo "Window: ${{ needs.parse.outputs.start }} → ${{ needs.parse.outputs.end }}"
+          echo "Effort: ${{ needs.parse.outputs.effort }}"
+          echo "Public: ${{ needs.parse.outputs.public }}, CDT: ${{ needs.parse.outputs.cdt }}, New app: ${{ needs.parse.outputs.new_app }}"
+          echo "Groups: ${{ needs.parse.outputs.groups }}"
+          echo "Notified: ${{ needs.parse.outputs.notified_when }} via ${{ needs.parse.outputs.notified_how }}"
+          echo "Backup: ${{ needs.parse.outputs.backup }}"
+          echo "Issue: ${{ needs.parse.outputs.title }}"
+          echo "URL: ${{ needs.parse.outputs.url }}"
+          printf "\nWHY:\n%s\n"  "${{ needs.parse.outputs.why }}"
+          printf "\nPLAN:\n%s\n" "${{ needs.parse.outputs.plan }}"
+          printf "\nRISK:\n%s\n" "${{ needs.parse.outputs.risk }}"           
+              
+              
+              
+              
