@@ -4,10 +4,12 @@ title: "[Change]"
 labels:
   - change-request
 body:
-  # ─────────────── Details (type-into fields) ───────────────
+  # ─────────────── Details ───────────────
   - type: markdown
     attributes:
-      value: "## Details"
+      value: |
+        ## Details
+        _Dates and high-level info._
 
   - type: input
     id: start_date
@@ -29,18 +31,22 @@ body:
     id: effort_project
     attributes:
       label: Effort / Project
+      placeholder: "Project / effort"
     validations:
       required: true
 
   # ─────────────── Rationale ───────────────
   - type: markdown
     attributes:
-      value: "## Rationale"
+      value: |
+        ## Rationale
+        _Why, how, and risks—keep it brief._
 
   - type: textarea
     id: justification
     attributes:
       label: Justification
+      placeholder: "Why this"
     validations:
       required: true
 
@@ -48,6 +54,7 @@ body:
     id: implementation_plan
     attributes:
       label: Implementation plan
+      placeholder: "High-level steps"
     validations:
       required: true
 
@@ -55,18 +62,22 @@ body:
     id: risk
     attributes:
       label: Risk
+      placeholder: "Top risks"
     validations:
       required: true
 
   # ─────────────── Audience & Contacts ───────────────
   - type: markdown
     attributes:
-      value: "## Audience & Contacts"
+      value: |
+        ## Audience & Contacts
+        _Who is impacted and how they were told._
 
   - type: input
     id: impacted_groups
     attributes:
       label: Impacted groups
+      placeholder: "Group name(s)"
     validations:
       required: true
 
@@ -94,10 +105,18 @@ body:
         - Meeting
         - Teams message
         - Email
+        - Call
+        - In Person
     validations:
       required: true
 
-  # ─────────────── Bottom: Backup + Checkboxes ───────────────
+  # ─────────────── Backup & Confirmations ───────────────
+  - type: markdown
+    attributes:
+      value: |
+        ## Backup & Confirmations
+        _Point of contact and quick flags._
+
   - type: input
     id: backup_contact
     attributes:
@@ -106,20 +125,12 @@ body:
     validations:
       required: true
 
-  - type: markdown
-    attributes:
-      value: "## Confirmations & Flags"
-
   - type: checkboxes
     id: checklist
     attributes:
       label: Confirmations
-      description: Please confirm the following by checking the boxes.
+      description: Please check any that apply.
       options:
-        - label: I have searched the existing issues and this is not a duplicate.
-          required: true
-        - label: I'd like to work on this issue myself.
-          required: false
         - label: Impacts the public.
           required: false
         - label: Involves CDT.
