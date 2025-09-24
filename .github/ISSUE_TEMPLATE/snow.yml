@@ -1,8 +1,6 @@
-name: Change / Release Request
-description: Basic change request form.
-title: "[Change]"
-labels:
-  - change-request
+name: "Release"
+description: "Request a new release"
+labels: ["release"]
 body:
   # ─────────────── Details ───────────────
   - type: markdown
