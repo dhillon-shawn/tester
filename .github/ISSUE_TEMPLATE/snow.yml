@@ -134,7 +134,7 @@ body:
       required: true
 
   # ─────────────── Bottom: “radio buttons” (single-choice) ───────────────
-  # GitHub Issue Forms don’t have native radios; use single-select dropdowns with no default.
+  # GitHub Issue Forms don’t have native radios; use single-select dropdowns with "no" default.
   - type: markdown
     attributes:
       value: "## Compliance & Exposure"
@@ -144,8 +144,8 @@ body:
     attributes:
       label: Does this impact the public?
       options:
-        - Yes
-        - No
+        - "yes"
+        - "no"
     validations:
       required: true
 
@@ -154,8 +154,8 @@ body:
     attributes:
       label: Does this involve CDT?
       options:
-        - Yes
-        - No
+        - "yes"
+        - "no"
     validations:
       required: true
 
@@ -164,8 +164,8 @@ body:
     attributes:
       label: Is this a new app (does ESD need to know)?
       options:
-        - Yes
-        - No
+        - "yes"
+        - "no"
     validations:
       required: true
 
