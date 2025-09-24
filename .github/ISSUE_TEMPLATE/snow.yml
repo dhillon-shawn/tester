@@ -1,6 +1,6 @@
 name: Change / Release Request
 description: Propose a change with dates, justification, plan, risks, and impacted users.
-title: " "
+title: "INSERT"
 labels:
   - change-request
 body:
