@@ -133,8 +133,6 @@ body:
     validations:
       required: true
 
-  # ─────────────── Bottom: “radio buttons” (single-choice) ───────────────
-  # GitHub Issue Forms don’t have native radios; use single-select dropdowns with "no" default.
   - type: markdown
     attributes:
       value: "## Compliance & Exposure"
@@ -168,10 +166,15 @@ body:
         - "no"
     validations:
       required: true
-
-  # ─────────────── Footer helper ───────────────
-  - type: markdown
+      
+  - type: checkboxes
+    id: checklist
     attributes:
-      value: >
-        _Tip: after submission, consider linking this issue to a **Project** item with
-        a **Date** field for native calendar pickers, timeline views, and automations._
+      label: "Confirmations"
+      description: "Please confirm the following by checking the boxes."
+      options:
+        - label: I have searched the existing issues and this is not a duplicate.
+          required: true
+        - label: I'd like to work on this issue myself.
+          required: false
+
