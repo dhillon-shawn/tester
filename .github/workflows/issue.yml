@@ -16,8 +16,8 @@ concurrency:
 jobs:
   parse:
     outputs:
-      start:         ${{ steps.parse.outputs.start }}
-      end:           ${{ steps.parse.outputs.end }}
+      start:         ${{ steps.parse.outputs.start_iso }}
+      end:           ${{ steps.parse.outputs.end_iso }}
       effort:        ${{ steps.parse.outputs.effort }}
       why:           ${{ steps.parse.outputs.why }}
       plan:          ${{ steps.parse.outputs.plan }}
@@ -173,7 +173,7 @@ jobs:
             })
               
             
-      - name: Parse issue → simple outputs (robust checkboxes)
+      - name: Parse issue → simple outputs (MM/DD/YY → ISO)
         id: parse
         uses: actions/github-script@v7
         with:
@@ -184,61 +184,47 @@ jobs:
             const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
             function block(label) {
-              const re = new RegExp(
-                `\\n\\s*#{1,6}\\s*${esc(label)}\\s*\\n([\\s\\S]*?)(?=\\n\\s*#{1,6}\\s*|$)`,
-                'i'
-              );
+              const re = new RegExp(`\\n\\s*#{1,6}\\s*${esc(label)}\\s*\\n([\\s\\S]*?)(?=\\n\\s*#{1,6}\\s*|$)`, 'i');
               const m = body.match(re);
               return (m ? m[1].trim() : '');
             }
+
             function line(label) {
               return block(label).split('\n').map(s => s.trim()).filter(Boolean)[0] || '';
             }
 
-            // ---------- Robust checkbox parsing ----------
-            const normalize = (s) =>
-              s.toLowerCase()
-              .replace(/\(.*?\)/g, ' ')     // drop parenthetical notes
-              .replace(/[^a-z0-9\s]/g, ' ') // strip punctuation
-              .replace(/\s+/g, ' ')         // collapse whitespace
-              .trim();
-
-            const cbBlock = block('Confirmations');
-            const cbLines = cbBlock.split('\n').map(l => l.trim());
-
-            // Collect found checkboxes from the body
-            const found = {}; // normLabel -> 'Yes'/'No'
-            for (const l of cbLines) {
-              const m = l.match(/^[*-]\s*\[( |x|X)\]\s*(.+?)\s*$/);
-              if (!m) continue;
-              const checked = (m[1].toLowerCase() === 'x');
-              const labelNorm = normalize(m[2]);
-              found[labelNorm] = checked ? 'Yes' : 'No';
+            function isoFromMDY2(s, field) {
+              const m = s.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2})$/);
+              if (!m) { core.warning(`Bad date (${field}): "${s}" (expect MM/DD/YY)`); return ''; }
+              let [_, mo, d, yy] = m;
+              const y = 2000 + parseInt(yy, 10);
+              mo = String(mo).padStart(2,'0');
+              d  = String(d).padStart(2,'0');
+              return `${y}-${mo}-${d}`;
             }
 
-            // Targets we care about (normalized)
-            const targets = {
-              public:  'impacts the public',
-              cdt:     'involves cdt',
-              new_app: 'new app esd needs to know'
-            };
-
-            // Default to 'No' and fill from found (supports minor text changes)
-            const pickByIncludes = (needle) => {
-              for (const k of Object.keys(found)) {
-                if (k === needle || k.includes(needle)) return found[k];
-              }
+            const norm = s => s.toLowerCase().replace(/\(.*?\)/g,' ').replace(/[^a-z0-9\s]/g,' ').replace(/\s+/g,' ').trim();
+            const cbText = block('Confirmations');
+            const found = {};
+            cbText.split('\n').forEach(l => {
+              const m = l.trim().match(/^[*-]\s*\[( |x|X)\]\s*(.+?)\s*$/);
+              if (!m) return;
+              found[norm(m[2])] = (m[1].toLowerCase() === 'x') ? 'Yes' : 'No';
+            });
+            const pick = key => {
+              const needle = norm(key);
+              for (const k of Object.keys(found)) if (k === needle || k.includes(needle)) return found[k];
               return 'No';
             };
 
-            const publicYN  = pickByIncludes(targets.public);
-            const cdtYN     = pickByIncludes(targets.cdt);
-            const newAppYN  = pickByIncludes(targets.new_app);
+            const startRaw = line('Start date');
+            const endRaw   = line('End date');
 
-            // ---------- Other fields ----------
             const out = {
-              start:         line('Start date'),
-              end:           line('End date'),
+              start:         startRaw,
+              end:           endRaw,
+              start_iso:     isoFromMDY2(startRaw, 'Start date'),
+              end_iso:       isoFromMDY2(endRaw, 'End date'),
               effort:        line('Effort/Project'),
               why:           block('Justification'),
               plan:          block('Implementation plan'),
@@ -248,9 +234,9 @@ jobs:
               notified_when: line('When were impacted users last notified?'),
               notified_how:  line('How were impacted users last notified?'),
               backup:        line('Backup contact (email)'),
-              public:        publicYN,
-              cdt:           cdtYN,
-              new_app:       newAppYN,
+              public:        pick('Impacts the public'),
+              cdt:           pick('Involves CDT'),
+              new_app:       pick('New app ESD needs to know'),
               issue:         String(issue.number),
               title:         issue.title || '',
               url:           issue.html_url || ''
